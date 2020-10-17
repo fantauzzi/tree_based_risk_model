@@ -25,8 +25,28 @@ import catboost
 
 from util import load_data, cindex
 
+
+def print_grid_search_results(results):
+    best_iter = results['cv_results']['iterations'][
+        np.argmin(results['cv_results']['test-Logloss-mean'])]
+    best_loss = np.min(results['cv_results']['test-Logloss-mean'])
+    print('Best params', results['params'], 'obtained at iteration', best_iter, 'with logloss', best_loss)
+
+
+# Compute and print C-Indices
+def print_dev_test_c_indices(classifier, X_dev, y_dev, X_test, y_test):
+    y_dev_preds = classifier.predict_proba(X_dev)[:, 1]
+    # print(f"Dev. C-Index on best model after grid-search: {cindex(y_dev.values, y_dev_preds)}")
+    print(f'Dev ROC AUC on best model after grid-search: {roc_auc_score(y_dev.values, y_dev_preds)}')
+
+    y_test_preds = classifier.predict_proba(X_test)[:, 1]
+    # print(f"Test C-Index on best model after grid-search: {cindex(y_test.values, y_test_preds)}")
+    print(f'Test ROC AUC on best model after grid-search: {roc_auc_score(y_test.values, y_test_preds)}')
+
+
 seed = 42
 iterations = 200
+hyper_iterations = 200
 
 # Load the NHANES I epidemiology dataset
 X_dev, X_test, y_dev, y_test = load_data(10)
@@ -42,6 +62,26 @@ y_test = y_test.astype(int)
 def count_samples_with_missing_data(df):
     res = sum(df.isnull().any(axis='columns'))
     return res
+
+
+def print_train_val_test_c_indices(classifier,
+                                   X_train,
+                                   y_train,
+                                   X_val,
+                                   y_val,
+                                   X_test,
+                                   y_test):
+    y_train_preds = classifier.predict_proba(X_train)[:, 1]
+    # print(f"Train C-Index: {cindex(y_train_dropped.values, y_train_preds)}")
+    print(f'Train ROC AUC: {roc_auc_score(y_train, y_train_preds)}')
+
+    y_val_preds = classifier.predict_proba(X_val)[:, 1]
+    # print(f"Val C-Index: {cindex(y_val_dropped.values, y_val_preds)}")
+    print(f'Val ROC AUC: {roc_auc_score(y_val, y_val_preds)}')
+
+    y_test_preds = classifier.predict_proba(X_test)[:, 1]
+    # print(f"Test C-Index: {cindex(y_test.values, y_test_preds)}")
+    print(f'Test ROC AUC: {roc_auc_score(y_test, y_test_preds)}')
 
 
 dev_missing_count = count_samples_with_missing_data(X_dev)
@@ -67,7 +107,7 @@ dev_pool_dropped = Pool(data=X_dev_dropped, label=y_dev_dropped, cat_features=ca
 train_pool_dropped = Pool(data=X_train_dropped, label=y_train_dropped, cat_features=cat_features)
 val_pool_dropped = Pool(data=X_val_dropped, label=y_val_dropped, cat_features=cat_features)
 test_pool = Pool(data=X_test, label=y_test, cat_features=cat_features)
-
+"""
 # Fit a model on the dataset from where samples with missing data have been dropped
 print('Fitting a model on the dataset from where samples with missing data have been dropped')
 model = CatBoostClassifier(iterations=iterations,
@@ -94,7 +134,7 @@ def print_train_val_test_c_indices(classifier,
 
     y_test_preds = classifier.predict_proba(X_test)[:, 1]
     # print(f"Test C-Index: {cindex(y_test.values, y_test_preds)}")
-    print(f'Train ROC AUC: {roc_auc_score(y_test, y_test_preds)}')
+    print(f'Test ROC AUC: {roc_auc_score(y_test, y_test_preds)}')
 
 
 print_train_val_test_c_indices(model,
@@ -107,11 +147,12 @@ print_train_val_test_c_indices(model,
 
 # Perform grid-search to optimize some of the hyper-parameters
 print('Performing grid-search for hyper-parameters optimization, without samples with missing data')
+"""
 param_grid = {
     'learning_rate': [.01, .05, .06, .07, 0.08, .1, .2],
     'depth': [2, 3, 4, 5, 6, 7, 8]
 }
-
+"""
 
 # Determine how many combinations of parameter values are in the grid
 def compute_n_combinations(grid):
@@ -145,25 +186,9 @@ grid_search_results = clf.grid_search(param_grid=param_grid,
                                       verbose=True)
 
 
-def print_grid_search_results(results):
-    best_iter = results['cv_results']['iterations'][
-        np.argmin(results['cv_results']['test-Logloss-mean'])]
-    best_loss = np.min(results['cv_results']['test-Logloss-mean'])
-    print('Best params', results['params'], 'obtained at iteration', best_iter, 'with logloss', best_loss)
-
-
 print_grid_search_results(grid_search_results)
 
 
-# Compute and print C-Indices
-def print_dev_test_c_indices(classifier, X_dev, y_dev, X_test, y_test):
-    y_dev_preds = classifier.predict_proba(X_dev)[:, 1]
-    # print(f"Dev. C-Index on best model after grid-search: {cindex(y_dev.values, y_dev_preds)}")
-    print(f'Dev ROC AUC on best model after grid-search: {roc_auc_score(y_dev.values, y_dev_preds)}')
-
-    y_test_preds = clf.predict_proba(X_test)[:, 1]
-    # print(f"Test C-Index on best model after grid-search: {cindex(y_test.values, y_test_preds)}")
-    print(f'Test ROC AUC on best model after grid-search: {roc_auc_score(y_test.values, y_test_preds)}')
 
 
 print_dev_test_c_indices(clf, X_dev_dropped, y_dev_dropped, X_test, y_test)
@@ -193,15 +218,25 @@ grid_search_results = clf2.grid_search(param_grid=param_grid,
 print_grid_search_results(grid_search_results)
 
 print_dev_test_c_indices(clf2, X_dev_mean_imputed, y_dev, X_test, y_test)
+"""
 
-# Now instead of the mean imputer use an iterative imputer.
 imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=1, min_value=0)
 imputer.fit(X_dev)
-X_dev_iter_imputed = pd.DataFrame(imputer.transform(X_dev), columns=X_dev.columns)
-# imputer.transform() above has converted the int columns with categories into float, need to be converted back to int
-X_dev_iter_imputed = X_dev_iter_imputed.astype({'Sex': int, 'Race': int})
-dev_pool_iter_imputed = Pool(data=X_dev_iter_imputed, label=y_dev, cat_features=cat_features)
 
+
+# Now instead of the mean imputer use an iterative imputer.
+
+def make_imputed_pool(X, y, imputer, cat_features):
+    X_imputed = pd.DataFrame(imputer.transform(X), columns=X.columns)
+    # imputer.transform() above has converted the int columns with categories into float, need to be converted back to int
+    X_imputed = X_imputed.astype({'Sex': int, 'Race': int})
+    pool = Pool(data=X_imputed, label=y, cat_features=cat_features)
+    return pool, X_imputed
+
+
+dev_pool_iter_imputed = make_imputed_pool(X_dev, y=y_dev, imputer=imputer, cat_features=cat_features)
+
+"""
 clf3 = CatBoostClassifier(iterations=iterations,
                           eval_metric='Logloss',
                           cat_features=cat_features,
@@ -216,44 +251,42 @@ grid_search_results = clf3.grid_search(param_grid=param_grid,
                                        verbose=True)
 print_grid_search_results(grid_search_results)
 
-print_dev_test_c_indices(clf, X_dev_iter_imputed, y_dev, X_test, y_test)
-
+print_dev_test_c_indices(clf3, X_dev_iter_imputed, y_dev, X_test, y_test)
+"""
 ''' Use the iterative imputer, but use Bayesian optimization for the hyper-parameters, instead of grid search. Here
 we use the train/val data sets '''
-print('Performing Bayesian search for hyper-parameters optimization, with missing data replaced with an iterative imputer')
 
-X_train_iter_imputed = pd.DataFrame(imputer.transform(X_train), columns=X_train.columns)
-# imputer.transform() above has converted the int columns with categories into float, need to be converted back to int
-X_train_iter_imputed = X_train_iter_imputed.astype({'Sex': int, 'Race': int})
-train_pool_iter_imputed = Pool(data=X_train_iter_imputed, label=y_train, cat_features=cat_features)
+""" Note: including a CatBoost Pool() here doesn't work, hyperopt throws an exception. Instances of Pool can be
+passed to the objective function in its closure instread. """
+param_space = {'learning_rate': hp.uniform('learning_rate', .01, .1),
+               'depth': hp.quniform('depth', 2, 8, 1),
+               'seed': seed,
+               'iterations': iterations
+               }
 
-X_val_iter_imputed = pd.DataFrame(imputer.transform(X_val), columns=X_val.columns)
-# imputer.transform() above has converted the int columns with categories into float, need to be converted back to int
-X_val_iter_imputed = X_val_iter_imputed.astype({'Sex': int, 'Race': int})
-val_pool_iter_imputed = Pool(data=X_val_iter_imputed, label=y_val, cat_features=cat_features)
+print(
+    'Performing Bayesian search for hyper-parameters optimization, with missing data replaced with an iterative imputer')
 
-param_space = {
-    'learning_rate': hp.uniform('learning_rate', .01, .1),
-    'depth': hp.quniform('depth', 2, 8, 1),
-    'seed': seed,
-    'iterations': iterations
-}
+train_pool_iter_imputed, X_train_iter_imputed = make_imputed_pool(X_train, y=y_train, imputer=imputer,
+                                                                  cat_features=cat_features)
 
+val_pool_iter_imputed, X_val_iter_imputed = make_imputed_pool(X_val, y=y_val, imputer=imputer,
+                                                              cat_features=cat_features)
 
 # The objective function, that hyperopt will minimize
 def objective(params):
-    model2 = CatBoostClassifier(iterations=params['iterations'],
-                                eval_metric='AUC',
-                                learning_rate=params['learning_rate'],
-                                depth=params['depth'],
-                                random_state=params['seed'])
-    training_res = model2.fit(train_pool_iter_imputed, eval_set=val_pool_iter_imputed, verbose=False)
+    model = CatBoostClassifier(iterations=params['iterations'],
+                               eval_metric='AUC',
+                               learning_rate=params['learning_rate'],
+                               depth=params['depth'],
+                               random_state=params['seed'])
+    training_res = model.fit(train_pool_iter_imputed, eval_set=val_pool_iter_imputed, verbose=False)
     auc = training_res.best_score_['validation']['AUC']
     return -auc  # The objective function is minimized
 
 
 rstate = np.random.RandomState(seed)
-best = fmin(fn=objective, space=param_space, algo=tpe.suggest, max_evals=100, rstate=rstate)
+best = fmin(fn=objective, space=param_space, algo=tpe.suggest, max_evals=hyper_iterations, rstate=rstate)
 print('Re-fitting the model with the best hyper-parameter values found:', best)
 model3 = CatBoostClassifier(iterations=iterations,
                             eval_metric='AUC',
@@ -269,31 +302,55 @@ print_train_val_test_c_indices(model3,
                                X_test,
                                y_test.values)
 
-"""
-# Compute the C-index on the train/val/test dataset
-y_train_preds = model3.predict_proba(X_train_iter_imputed)[:, 1]
-print(f"Train C-Index: {cindex(y_train.values, y_train_preds)}")
-print(f'Train ROC AUC: {roc_auc_score(y_train.values, y_train_preds)}')
+# ------------------------------
 
-y_val_preds = model3.predict_proba(X_val_iter_imputed)[:, 1]
-print(f"Val C-Index: {cindex(y_val.values, y_val_preds)}")
-print(f'Val ROC AUC: {roc_auc_score(y_val.values, y_val_preds)}')
+print(
+    'Performing Bayesian search for hyper-parameters optimization, without replacement of missing data')
 
-y_test_preds = model3.predict_proba(X_test)[:, 1]
-print(f"Test C-Index: {cindex(y_test.values, y_test_preds)}")
-print(f'Train ROC AUC: {roc_auc_score(y_test.values, y_test_preds)}')
-"""
+train_pool = Pool(data=X_train, label=y_train, cat_features=cat_features)
+val_pool = Pool(data=X_val, label=y_val, cat_features=cat_features)
+
+
+def objective2(params):
+    model = CatBoostClassifier(iterations=params['iterations'],
+                               eval_metric='AUC',
+                               learning_rate=params['learning_rate'],
+                               depth=params['depth'],
+                               random_state=params['seed'])
+    training_res = model.fit(train_pool, eval_set=val_pool, verbose=False)
+    auc = training_res.best_score_['validation']['AUC']
+    return -auc  # The objective function is minimized
+
+
+rstate = np.random.RandomState(seed)
+best = fmin(fn=objective2, space=param_space, algo=tpe.suggest, max_evals=hyper_iterations, rstate=rstate)
+print('Re-fitting the model with the best hyper-parameter values found:', best)
+model3 = CatBoostClassifier(iterations=iterations,
+                            eval_metric='AUC',
+                            **best,
+                            random_state=seed)
+training_res = model3.fit(train_pool, eval_set=val_pool, verbose=iterations // 10)
+
+print_train_val_test_c_indices(model3,
+                               X_train,
+                               y_train.values,
+                               X_val,
+                               y_val.values,
+                               X_test,
+                               y_test.values)
+
 ''' TODO
-Introduce hyperopt
-Use c-index (custom metric) to select models instead of loss. C-index is the same as the ROC AUC for logistic regression.
-   see https://www.statisticshowto.com/c-statistic/#:~:text=A%20weighted%20c-index%20is,correctly%20predicting%20a%20negative%20outcome
-   and also https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4886856/  and https://bit.ly/3dvUh07
+Check the loss/ROC issue filed on GitHub
 How does CatBoost deal with missing data (None/NaN)?
+Unbalanced dataset, try using weights
 Leverage Tensorboard
 How to display CatBoost charts outside of notebook? Is it possible?
 Explore Seaborne
-Use the whole HANES dataset from CDC
+Use the whole HANES dataset from CDC, and also try with GPU
 Try other strategies for imputation based on mean encoding and similar
 Instead of checking if survival after 10 years, estimate the number of years of survival
-Unbalanced dataset, try using weights
+C-index is the same as the ROC AUC for logistic regression.
+   see https://www.statisticshowto.com/c-statistic/#:~:text=A%20weighted%20c-index%20is,correctly%20predicting%20a%20negative%20outcome
+   and also https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4886856/  and https://bit.ly/3dvUh07
+
 '''
