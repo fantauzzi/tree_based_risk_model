@@ -36,17 +36,15 @@ def print_grid_search_results(results):
 # Compute and print C-Indices
 def print_dev_test_c_indices(classifier, X_dev, y_dev, X_test, y_test):
     y_dev_preds = classifier.predict_proba(X_dev)[:, 1]
-    # print(f"Dev. C-Index on best model after grid-search: {cindex(y_dev.values, y_dev_preds)}")
     print(f'Dev ROC AUC on best model after grid-search: {roc_auc_score(y_dev.values, y_dev_preds)}')
 
     y_test_preds = classifier.predict_proba(X_test)[:, 1]
-    # print(f"Test C-Index on best model after grid-search: {cindex(y_test.values, y_test_preds)}")
     print(f'Test ROC AUC on best model after grid-search: {roc_auc_score(y_test.values, y_test_preds)}')
 
 
 seed = 42
-iterations = 200
-hyper_iterations = 200
+iterations = 100
+hyper_iterations = 100
 
 # Load the NHANES I epidemiology dataset
 X_dev, X_test, y_dev, y_test = load_data(10)
@@ -72,15 +70,12 @@ def print_train_val_test_c_indices(classifier,
                                    X_test,
                                    y_test):
     y_train_preds = classifier.predict_proba(X_train)[:, 1]
-    # print(f"Train C-Index: {cindex(y_train_dropped.values, y_train_preds)}")
     print(f'Train ROC AUC: {roc_auc_score(y_train, y_train_preds)}')
 
     y_val_preds = classifier.predict_proba(X_val)[:, 1]
-    # print(f"Val C-Index: {cindex(y_val_dropped.values, y_val_preds)}")
     print(f'Val ROC AUC: {roc_auc_score(y_val, y_val_preds)}')
 
     y_test_preds = classifier.predict_proba(X_test)[:, 1]
-    # print(f"Test C-Index: {cindex(y_test.values, y_test_preds)}")
     print(f'Test ROC AUC: {roc_auc_score(y_test, y_test_preds)}')
 
 
@@ -220,124 +215,96 @@ print_grid_search_results(grid_search_results)
 print_dev_test_c_indices(clf2, X_dev_mean_imputed, y_dev, X_test, y_test)
 """
 
-imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=1, min_value=0)
-imputer.fit(X_dev)
+iter_imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=1, min_value=0)
+iter_imputer.fit(X_dev)
 
 
 # Now instead of the mean imputer use an iterative imputer.
 
 def make_imputed_pool(X, y, imputer, cat_features):
-    X_imputed = pd.DataFrame(imputer.transform(X), columns=X.columns)
+    X_imputed = X if imputer is None else pd.DataFrame(imputer.transform(X), columns=X.columns)
     # imputer.transform() above has converted the int columns with categories into float, need to be converted back to int
     X_imputed = X_imputed.astype({'Sex': int, 'Race': int})
     pool = Pool(data=X_imputed, label=y, cat_features=cat_features)
     return pool, X_imputed
 
 
-dev_pool_iter_imputed = make_imputed_pool(X_dev, y=y_dev, imputer=imputer, cat_features=cat_features)
+dev_pool_iter_imputed = make_imputed_pool(X_dev, y=y_dev, imputer=iter_imputer, cat_features=cat_features)
 
-"""
-clf3 = CatBoostClassifier(iterations=iterations,
-                          eval_metric='Logloss',
-                          cat_features=cat_features,
-                          random_state=seed)
-
-print('Performing grid-search for hyper-parameters optimization, with missing data replaced with an iterative imputer')
-grid_search_results = clf3.grid_search(param_grid=param_grid,
-                                       X=dev_pool_iter_imputed,
-                                       search_by_train_test_split=True,
-                                       cv=5,
-                                       partition_random_seed=seed,
-                                       verbose=True)
-print_grid_search_results(grid_search_results)
-
-print_dev_test_c_indices(clf3, X_dev_iter_imputed, y_dev, X_test, y_test)
-"""
 ''' Use the iterative imputer, but use Bayesian optimization for the hyper-parameters, instead of grid search. Here
-we use the train/val data sets '''
+we use the train/val data sets
 
-""" Note: including a CatBoost Pool() here doesn't work, hyperopt throws an exception. Instances of Pool can be
-passed to the objective function in its closure instread. """
+Note: including a CatBoost Pool() here doesn't work, hyperopt throws an exception. Instances of Pool can be
+passed to the objective function in its closure instread. '''
+
+
+def run_exp_bayes_hyperparams_opt(X_train, y_train, X_val, y_val, cat_features, param_space, max_evals, imputer):
+    train_pool, X_train_imputed = make_imputed_pool(X_train,
+                                                    y=y_train,
+                                                    imputer=imputer,
+                                                    cat_features=cat_features)
+
+    val_pool, X_val_imputed = make_imputed_pool(X_val,
+                                                y=y_val,
+                                                imputer=imputer,
+                                                cat_features=cat_features)
+
+    # The objective function, that hyperopt will minimize
+    def objective(params):
+        model = CatBoostClassifier(iterations=params['iterations'],
+                                   eval_metric='AUC',
+                                   learning_rate=params['learning_rate'],
+                                   depth=params['depth'],
+                                   random_state=params['seed'])
+        training_res = model.fit(train_pool, eval_set=val_pool, verbose=False)
+        auc = training_res.best_score_['validation']['AUC']
+        return -auc  # The objective function is minimized
+
+    rstate = np.random.RandomState(seed)
+    best = fmin(fn=objective, space=param_space, algo=tpe.suggest, max_evals=max_evals, rstate=rstate)
+    print('Re-fitting the model with the best hyper-parameter values found:', best)
+    refit_model = CatBoostClassifier(iterations=param_space['iterations'],
+                                     eval_metric='AUC',
+                                     **best,
+                                     random_state=param_space['seed'])
+    training_res = refit_model.fit(train_pool, eval_set=val_pool, verbose=iterations // 10)
+
+    print_train_val_test_c_indices(refit_model,
+                                   X_train_imputed,
+                                   y_train.values,
+                                   X_val_imputed,
+                                   y_val.values,
+                                   X_test,
+                                   y_test.values)
+
+
 param_space = {'learning_rate': hp.uniform('learning_rate', .01, .1),
                'depth': hp.quniform('depth', 2, 8, 1),
                'seed': seed,
                'iterations': iterations
                }
 
-print(
-    'Performing Bayesian search for hyper-parameters optimization, with missing data replaced with an iterative imputer')
+print('Performing Bayesian search for hyper-parameters optimization, with missing data replaced with iterative imputer')
 
-train_pool_iter_imputed, X_train_iter_imputed = make_imputed_pool(X_train, y=y_train, imputer=imputer,
-                                                                  cat_features=cat_features)
+run_exp_bayes_hyperparams_opt(X_train,
+                              y_train,
+                              X_val,
+                              y_val,
+                              cat_features=cat_features,
+                              param_space=param_space,
+                              max_evals=hyper_iterations,
+                              imputer=iter_imputer)
 
-val_pool_iter_imputed, X_val_iter_imputed = make_imputed_pool(X_val, y=y_val, imputer=imputer,
-                                                              cat_features=cat_features)
+print('Performing Bayesian search for hyper-parameters optimization, without replacement of missing data')
 
-# The objective function, that hyperopt will minimize
-def objective(params):
-    model = CatBoostClassifier(iterations=params['iterations'],
-                               eval_metric='AUC',
-                               learning_rate=params['learning_rate'],
-                               depth=params['depth'],
-                               random_state=params['seed'])
-    training_res = model.fit(train_pool_iter_imputed, eval_set=val_pool_iter_imputed, verbose=False)
-    auc = training_res.best_score_['validation']['AUC']
-    return -auc  # The objective function is minimized
-
-
-rstate = np.random.RandomState(seed)
-best = fmin(fn=objective, space=param_space, algo=tpe.suggest, max_evals=hyper_iterations, rstate=rstate)
-print('Re-fitting the model with the best hyper-parameter values found:', best)
-model3 = CatBoostClassifier(iterations=iterations,
-                            eval_metric='AUC',
-                            **best,
-                            random_state=seed)
-training_res = model3.fit(train_pool_iter_imputed, eval_set=val_pool_iter_imputed, verbose=iterations // 10)
-
-print_train_val_test_c_indices(model3,
-                               X_train_iter_imputed,
-                               y_train.values,
-                               X_val_iter_imputed,
-                               y_val.values,
-                               X_test,
-                               y_test.values)
-
-# ------------------------------
-
-print(
-    'Performing Bayesian search for hyper-parameters optimization, without replacement of missing data')
-
-train_pool = Pool(data=X_train, label=y_train, cat_features=cat_features)
-val_pool = Pool(data=X_val, label=y_val, cat_features=cat_features)
-
-
-def objective2(params):
-    model = CatBoostClassifier(iterations=params['iterations'],
-                               eval_metric='AUC',
-                               learning_rate=params['learning_rate'],
-                               depth=params['depth'],
-                               random_state=params['seed'])
-    training_res = model.fit(train_pool, eval_set=val_pool, verbose=False)
-    auc = training_res.best_score_['validation']['AUC']
-    return -auc  # The objective function is minimized
-
-
-rstate = np.random.RandomState(seed)
-best = fmin(fn=objective2, space=param_space, algo=tpe.suggest, max_evals=hyper_iterations, rstate=rstate)
-print('Re-fitting the model with the best hyper-parameter values found:', best)
-model3 = CatBoostClassifier(iterations=iterations,
-                            eval_metric='AUC',
-                            **best,
-                            random_state=seed)
-training_res = model3.fit(train_pool, eval_set=val_pool, verbose=iterations // 10)
-
-print_train_val_test_c_indices(model3,
-                               X_train,
-                               y_train.values,
-                               X_val,
-                               y_val.values,
-                               X_test,
-                               y_test.values)
+run_exp_bayes_hyperparams_opt(X_train,
+                              y_train,
+                              X_val,
+                              y_val,
+                              cat_features=cat_features,
+                              param_space=param_space,
+                              max_evals=hyper_iterations,
+                              imputer=None)
 
 ''' TODO
 Check the loss/ROC issue filed on GitHub
