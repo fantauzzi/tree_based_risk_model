@@ -26,13 +26,6 @@ import catboost
 from util import load_data, cindex
 
 
-def print_grid_search_results(results):
-    best_iter = results['cv_results']['iterations'][
-        np.argmin(results['cv_results']['test-Logloss-mean'])]
-    best_loss = np.min(results['cv_results']['test-Logloss-mean'])
-    print('Best params', results['params'], 'obtained at iteration', best_iter, 'with logloss', best_loss)
-
-
 def print_train_val_test_c_indices(classifier,
                                    X_train,
                                    y_train,
@@ -59,8 +52,8 @@ def make_imputed_pool(X, y, imputer, cat_features):
 
 
 seed = 42
-iterations = 200
-hyper_iterations = 200
+iterations = 100
+hyper_iterations = 100
 
 # Load the NHANES I epidemiology dataset
 X_dev, X_test, y_dev, y_test = load_data(10)
@@ -111,8 +104,8 @@ set for the model (AUC). '''
 
 # TODO: Check the above, might be not true!
 
-
 def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_grid, imputer=None):
+
     dev_pool, X_inputed = make_imputed_pool(X, y, imputer, cat_features)
     model = CatBoostClassifier(iterations=iterations,
                                eval_metric='AUC:hints=skip_train~false',
@@ -127,9 +120,13 @@ def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_gri
                                             partition_random_seed=seed,
                                             verbose=True)
 
-    print_grid_search_results(grid_search_results)
-    y_preds = model.predict_proba(X)[:, 1]
-    print(f'ROC AUC on best model after grid-search: {roc_auc_score(y.values, y_preds)}')
+    best_iter = np.argmax(grid_search_results['cv_results']['test-AUC-mean'])
+    best_AUC = grid_search_results['cv_results']['test-AUC-mean'][best_iter]
+    loss_for_best_AUC = grid_search_results['cv_results']['test-Logloss-mean'][best_iter]
+    print('Best params', grid_search_results['params'], 'with AUC', best_AUC, 'obtained at iteration', best_iter, 'with Logloss', loss_for_best_AUC)
+    return model
+    # y_preds = model.predict_proba(X)[:, 1]
+    # print(f'ROC AUC on best model after grid-search: {roc_auc_score(y.values, y_preds)}')
 
 
 param_grid = {'learning_rate': [.01, .05, .06, .07, 0.08, .1, .2],
@@ -246,8 +243,9 @@ run_exp_bayes_hyperparams_opt(X_train,
                               imputer=None)
 
 ''' TODO
+Check the warning: [IterativeImputer] Early stopping criterion not reached.
 Check the loss/ROC issue filed on GitHub
-How does CatBoost deal with missing data (None/NaN)?
+Try Karpathy approach
 Unbalanced dataset, try using weights
 Leverage Tensorboard
 How to display CatBoost charts outside of notebook? Is it possible?
