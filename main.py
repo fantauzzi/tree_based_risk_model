@@ -1,29 +1,19 @@
 import shap
 import sklearn
-import itertools
 import pydotplus
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
-
 from IPython.display import Image
-
-from sklearn.tree import export_graphviz
-# from sklearn.externals.six import StringIO
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.experimental import enable_iterative_imputer
-# from sklearn.impute import IterativeImputer, SimpleImputer
-from catboost import CatBoostClassifier, Pool
-from sklearn.model_selection import GridSearchCV
+from catboost import CatBoostClassifier, Pool, cv
 from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.metrics import roc_auc_score
 from hyperopt import fmin, tpe, space_eval, hp
-import catboost
 
-from util import load_data, cindex
+from util import load_data
 
 
 def print_train_val_test_c_indices(classifier,
@@ -52,8 +42,9 @@ def make_imputed_pool(X, y, imputer, cat_features, weight=None):
 
 
 seed = 42
-iterations = 200
-hyper_iterations = 200
+iterations = 20
+hyper_iterations = 20
+cv_folds = 4
 
 # Load the NHANES I epidemiology dataset
 X_dev, X_test, y_dev, y_test = load_data(10)
@@ -143,7 +134,7 @@ def run_exp_bayes_hyperparams_opt(X_train,
     # The objective function, that hyperopt will minimize
     def objective(params):
         model = CatBoostClassifier(iterations=params['iterations'],
-                                   eval_metric='AUC',
+                                   eval_metric='AUC:hints=skip_train~false',
                                    learning_rate=params['learning_rate'],
                                    depth=params['depth'],
                                    random_state=params['seed'])
@@ -155,18 +146,17 @@ def run_exp_bayes_hyperparams_opt(X_train,
     best = fmin(fn=objective, space=param_space, algo=tpe.suggest, max_evals=max_evals, rstate=rstate)
     print('Re-fitting the model with the best hyper-parameter values found:', best)
     refit_model = CatBoostClassifier(iterations=param_space['iterations'],
-                                     eval_metric='AUC',
+                                     eval_metric='AUC:hints=skip_train~false',
                                      **best,
                                      random_state=param_space['seed'])
-    training_res = refit_model.fit(train_pool, eval_set=val_pool, verbose=iterations // 10)
+    training_res = refit_model.fit(train_pool, eval_set=val_pool, verbose=False)
 
-    print_train_val_test_c_indices(refit_model,
-                                   X_train_imputed,
-                                   y_train.values,
-                                   X_val_imputed,
-                                   y_val.values,
-                                   X_test,
-                                   y_test.values)
+    y_train_preds = refit_model.predict_proba(X_train)[:, 1]
+    training_AUC = roc_auc_score(y_train, y_train_preds)
+    print(f"Training: Log loss={training_res.best_score_['learn']['Logloss']}   ROC AUC={training_AUC}")
+    print(
+        f"Validation: Log loss={training_res.best_score_['validation']['Logloss']}   ROC AUC={training_res.best_score_['validation']['AUC']}")
+    return refit_model
 
 
 ''' Use the iterative imputer, but use Bayesian optimization for the hyper-parameters, instead of grid search. Here
@@ -205,25 +195,25 @@ run_exp_bayes_hyperparams_opt(X_train,
 print(
     '\nPerforming Bayesian search for hyper-parameters optimization, with missing data replaced with iterative imputer')
 
-run_exp_bayes_hyperparams_opt(X_train,
-                              y_train,
-                              X_val,
-                              y_val,
-                              cat_features=cat_features,
-                              param_space=param_space,
-                              max_evals=hyper_iterations,
-                              imputer=iter_imputer)
+selected_model_imputed = run_exp_bayes_hyperparams_opt(X_train,
+                                                       y_train,
+                                                       X_val,
+                                                       y_val,
+                                                       cat_features=cat_features,
+                                                       param_space=param_space,
+                                                       max_evals=hyper_iterations,
+                                                       imputer=iter_imputer)
 
 print('\nPerforming Bayesian search for hyper-parameters optimization, without replacement of missing data')
 
-run_exp_bayes_hyperparams_opt(X_train,
-                              y_train,
-                              X_val,
-                              y_val,
-                              cat_features=cat_features,
-                              param_space=param_space,
-                              max_evals=hyper_iterations,
-                              imputer=None)
+selected_model = run_exp_bayes_hyperparams_opt(X_train,
+                                               y_train,
+                                               X_val,
+                                               y_val,
+                                               cat_features=cat_features,
+                                               param_space=param_space,
+                                               max_evals=hyper_iterations,
+                                               imputer=None)
 
 print('\nPerforming Bayesian search for hyper-parameters optimization, without replacement and with weights')
 
@@ -249,7 +239,7 @@ Once method grid_search() has selected the best combination of hyper-parameters,
 can be evaluated with x-evaluation by setting parameter `calc_cv_statistics` to True (default). '''
 
 
-def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_grid, imputer=None):
+def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_grid, cv_folds, imputer=None):
     dev_pool, X_inputed = make_imputed_pool(X, y, imputer, cat_features)
     model = CatBoostClassifier(iterations=iterations,
                                eval_metric='AUC:hints=skip_train~false',
@@ -260,7 +250,7 @@ def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_gri
                                             param_grid=param_grid,
                                             search_by_train_test_split=True,
                                             calc_cv_statistics=True,
-                                            cv=5,
+                                            cv=cv_folds,
                                             partition_random_seed=seed,
                                             verbose=True)
 
@@ -268,10 +258,8 @@ def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_gri
     best_AUC = grid_search_results['cv_results']['test-AUC-mean'][best_iter]
     loss_for_best_AUC = grid_search_results['cv_results']['test-Logloss-mean'][best_iter]
     print('Best params', grid_search_results['params'], 'with AUC', best_AUC, 'obtained at iteration', best_iter,
-          'with Logloss', loss_for_best_AUC)
+          'with Log loss', loss_for_best_AUC)
     return model
-    # y_preds = model.predict_proba(X)[:, 1]
-    # print(f'ROC AUC on best model after grid-search: {roc_auc_score(y.values, y_preds)}')
 
 
 param_grid = {'learning_rate': np.arange(.01, .2, .01),
@@ -285,12 +273,47 @@ run_exp_grid_hyperparams_opt(X=X_dev,
                              seed=seed,
                              iterations=iterations,
                              param_grid=param_grid,
+                             cv_folds=cv_folds,
                              imputer=None)
 
+# Cross-validate the two selected models, and test them on the test set
+for model, descr, imputer in zip((selected_model, selected_model_imputed), ('without imputation', 'with imputation'),
+                                 (None, iter_imputer)):
+    print(f'\nCross-validating model {descr}.')
+    params = model.get_params()
+    params['loss_function'] = 'Logloss'
+    params['eval_metric'] = 'AUC:hints=skip_train~false'
+    X_pool, _ = make_imputed_pool(X_dev, y_dev, imputer=imputer, cat_features=cat_features, weight=None)
+    cv_results = cv(pool=X_pool,
+                    params=params,
+                    iterations=iterations,
+                    fold_count=4,
+                    partition_random_seed=seed,
+                    stratified=True,
+                    verbose=False)
+    # Find the iteration with the best test AUC, its AUC and other train and test stats.
+    best_cv_iter = np.argmax(cv_results['test-AUC-mean'])  # All the stats retrieved will refer to this same iteration
+    best_cv_val_AUC = cv_results['test-AUC-mean'][best_cv_iter]
+    best_cv_val_Logloss = cv_results['test-Logloss-mean'][best_cv_iter]
+    best_cv_train_AUC = cv_results['train-AUC-mean'][best_cv_iter]
+    best_cv_train_Logloss = cv_results['train-Logloss-mean'][best_cv_iter]
+    print('Best validation with parameters', params, 'achieved at iteration', best_cv_iter)
+    print(f'Training: Logloss {best_cv_train_Logloss}   ROC AUC {best_cv_train_AUC}')
+    print(f'Validation: Logloss {best_cv_val_Logloss}   ROC AUC {best_cv_val_AUC}')
+
+    print('Re-fitting the model and testing it')
+    test_pool, _ = make_imputed_pool(X_test, y_test, imputer=None, cat_features=cat_features, weight=None)
+    params['iterations'] = best_cv_iter + 1  # Shrink the model to the best iteration found during cross-validation
+    cv_model = CatBoostClassifier(**params)
+    training_res = cv_model.fit(X_pool, eval_set=test_pool, verbose=False)
+    print('Iteration:', training_res.best_iteration_)
+    y_train_preds = cv_model.predict_proba(X_dev)[:, 1]
+    training_AUC = roc_auc_score(y_dev, y_train_preds)
+    print(f"Training (on dev. set): Log loss={training_res.best_score_['learn']['Logloss']}   ROC AUC={training_AUC}")
+    print(
+        f"Test (on test set): Log loss={training_res.best_score_['validation']['Logloss']}   ROC AUC={training_res.best_score_['validation']['AUC']}")
+
 ''' TODO
-Unbalanced dataset, try using weights
-Add x-validation at the end of the Bayesian hyper-opt too 
-Add indication of the Logloss of the best model after grid/Bayesian search
 Try Karpathy approach
 Leverage Tensorboard
 How to display CatBoost charts outside of notebook? Is it possible?
