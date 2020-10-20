@@ -4,6 +4,8 @@ import pydotplus
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import shutil
+from pathlib import Path
 import matplotlib.pyplot as plt
 from IPython.display import Image
 from sklearn.model_selection import train_test_split
@@ -45,6 +47,12 @@ seed = 42
 iterations = 20
 hyper_iterations = 20
 cv_folds = 4
+logs_dir = Path('catboost_logs')
+
+logs_dir.mkdir(exist_ok=True)
+for item in logs_dir.iterdir():
+    if item.is_dir():
+        shutil.rmtree(str(item))
 
 # Load the NHANES I epidemiology dataset
 X_dev, X_test, y_dev, y_test = load_data(10)
@@ -119,7 +127,8 @@ def run_exp_bayes_hyperparams_opt(X_train,
                                   param_space,
                                   max_evals,
                                   imputer,
-                                  weights=None):
+                                  train_dir=None,
+                                  weights=None, ):
     train_pool, X_train_imputed = make_imputed_pool(X_train,
                                                     y=y_train,
                                                     imputer=imputer,
@@ -148,8 +157,11 @@ def run_exp_bayes_hyperparams_opt(X_train,
     refit_model = CatBoostClassifier(iterations=param_space['iterations'],
                                      eval_metric='AUC:hints=skip_train~false',
                                      **best,
-                                     random_state=param_space['seed'])
-    training_res = refit_model.fit(train_pool, eval_set=val_pool, verbose=False)
+                                     random_state=param_space['seed'],
+                                     train_dir=train_dir)
+    training_res = refit_model.fit(train_pool,
+                                   eval_set=val_pool,
+                                   verbose=False)
 
     y_train_preds = refit_model.predict_proba(X_train)[:, 1]
     training_AUC = roc_auc_score(y_train, y_train_preds)
@@ -179,7 +191,8 @@ run_exp_bayes_hyperparams_opt(X_train_dropped,
                               cat_features=cat_features,
                               param_space=param_space,
                               max_evals=hyper_iterations,
-                              imputer=None)
+                              imputer=None,
+                              train_dir=str(logs_dir / 'catboost_logs_drop'))
 
 print('\nPerforming Bayesian search for hyper-parameters optimization, with missing data replaced with mean imputer')
 
@@ -190,7 +203,8 @@ run_exp_bayes_hyperparams_opt(X_train,
                               cat_features=cat_features,
                               param_space=param_space,
                               max_evals=hyper_iterations,
-                              imputer=mean_imputer)
+                              imputer=mean_imputer,
+                              train_dir=str(logs_dir / 'catboost_logs_mean_imputer'))
 
 print(
     '\nPerforming Bayesian search for hyper-parameters optimization, with missing data replaced with iterative imputer')
@@ -202,7 +216,8 @@ selected_model_imputed = run_exp_bayes_hyperparams_opt(X_train,
                                                        cat_features=cat_features,
                                                        param_space=param_space,
                                                        max_evals=hyper_iterations,
-                                                       imputer=iter_imputer)
+                                                       imputer=iter_imputer,
+                                                       train_dir=str(logs_dir / 'catboost_logs_iter_imputer'))
 
 print('\nPerforming Bayesian search for hyper-parameters optimization, without replacement of missing data')
 
@@ -213,7 +228,8 @@ selected_model = run_exp_bayes_hyperparams_opt(X_train,
                                                cat_features=cat_features,
                                                param_space=param_space,
                                                max_evals=hyper_iterations,
-                                               imputer=None)
+                                               imputer=None,
+                                               train_dir=str(logs_dir / 'catboost_logs_keep_nan'))
 
 print('\nPerforming Bayesian search for hyper-parameters optimization, without replacement and with weights')
 
@@ -230,7 +246,8 @@ run_exp_bayes_hyperparams_opt(X_train,
                               param_space=param_space,
                               max_evals=hyper_iterations,
                               imputer=None,
-                              weights=w)
+                              weights=w,
+                              train_dir=str(logs_dir / 'catboost_logs_weights'))
 
 ''' Grid-search is done on the dev. set, as the grid-search takes care of splitting it into training and validation.
 Note: if `search_by_train_test_split` is set to True, every combination of values of the hyper-parameters is evaluated
@@ -239,12 +256,14 @@ Once method grid_search() has selected the best combination of hyper-parameters,
 can be evaluated with x-evaluation by setting parameter `calc_cv_statistics` to True (default). '''
 
 
-def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_grid, cv_folds, imputer=None):
+def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_grid, cv_folds, imputer=None,
+                                 train_dir=None):
     dev_pool, X_inputed = make_imputed_pool(X, y, imputer, cat_features)
     model = CatBoostClassifier(iterations=iterations,
                                eval_metric='AUC:hints=skip_train~false',
                                cat_features=cat_features,
-                               random_state=seed)
+                               random_state=seed,
+                               train_dir=train_dir)
 
     grid_search_results = model.grid_search(X=dev_pool,
                                             param_grid=param_grid,
@@ -263,9 +282,15 @@ def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_gri
 
 
 param_grid = {'learning_rate': np.arange(.01, .2, .01),
-              'depth': [2, 3, 4, 5, 6, 7, 8]}
+              'depth': list(range(2, 8))}
+
+# Count the number of hyper-parameter combinations in the grid
+n_grid_points = 1
+for param in param_grid:
+    n_grid_points *= len(param)
 
 print('\nPerforming grid-search for hyper-parameters optimization while maintaining missing data')
+print(f'Searching over {n_grid_points} combinations')
 
 run_exp_grid_hyperparams_opt(X=X_dev,
                              y=y_dev,
@@ -274,15 +299,17 @@ run_exp_grid_hyperparams_opt(X=X_dev,
                              iterations=iterations,
                              param_grid=param_grid,
                              cv_folds=cv_folds,
-                             imputer=None)
+                             imputer=None,
+                             train_dir=str(logs_dir / 'catboost_logs_grid_search'))
 
 # Cross-validate the two selected models, and test them on the test set
-for model, descr, imputer in zip((selected_model, selected_model_imputed), ('without imputation', 'with imputation'),
+for model, descr, imputer in zip((selected_model, selected_model_imputed), ('without_imputation', 'with_imputation'),
                                  (None, iter_imputer)):
     print(f'\nCross-validating model {descr}.')
     params = model.get_params()
     params['loss_function'] = 'Logloss'
     params['eval_metric'] = 'AUC:hints=skip_train~false'
+    params['train_dir'] = str(logs_dir / ('catboost_logs_cv_'+descr) )
     X_pool, _ = make_imputed_pool(X_dev, y_dev, imputer=imputer, cat_features=cat_features, weight=None)
     cv_results = cv(pool=X_pool,
                     params=params,
@@ -315,6 +342,7 @@ for model, descr, imputer in zip((selected_model, selected_model_imputed), ('wit
 
 ''' TODO
 Try Karpathy approach
+Try other tunable parameters https://catboost.ai/docs/concepts/parameter-tuning.html (also increase max tree depth to 16)
 Leverage Tensorboard
 How to display CatBoost charts outside of notebook? Is it possible?
 Explore Seaborne
