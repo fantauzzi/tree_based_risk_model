@@ -14,6 +14,7 @@ from catboost import CatBoostClassifier, Pool, cv
 from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.metrics import roc_auc_score
 from hyperopt import fmin, tpe, space_eval, hp
+from time import time
 
 from util import load_data
 
@@ -43,12 +44,18 @@ def make_imputed_pool(X, y, imputer, cat_features, weight=None):
     return pool, X_imputed
 
 
-seed = 42
-iterations = 20
-hyper_iterations = 20
-cv_folds = 4
-logs_dir = Path('catboost_logs')
+#############################################################################################################
+seed = 42  # For random numbers generation
+iterations = 20  # Max number of iterations at every run of gradien boosting (max number of trees built)
+hyper_iterations = 20  # Number of iterations required during each Bayesian optimization of hyper-parameters
+cv_folds = 4  # Number of folds used for k-folds cross-validation
+logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
+task_type = 'GPU'  # Can be 'CPU' or 'GPU'
+#############################################################################################################
 
+start_time = time()
+
+# Make the logs directory, if it doesn't exist already, and make sure it is empty
 logs_dir.mkdir(exist_ok=True)
 for item in logs_dir.iterdir():
     if item.is_dir():
@@ -89,10 +96,10 @@ y_val_dropped = y_val.loc[X_val_dropped.index]
 
 # Now impute missing values using the mean, instead of dropping samples containing them
 mean_imputer = SimpleImputer(strategy='mean', verbose=0)
-mean_imputer.fit(X_dev)  # TODO should this be fit on val or dev dataset?
+mean_imputer.fit(X_train)
 
 iter_imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=10, min_value=0, verbose=0)
-iter_imputer.fit(X_dev)  # TODO should this be fit on val or dev dataset?
+iter_imputer.fit(X_train)
 
 cat_features = [3, 11]  # Categorical features are race and sex
 
@@ -128,7 +135,7 @@ def run_exp_bayes_hyperparams_opt(X_train,
                                   max_evals,
                                   imputer,
                                   train_dir=None,
-                                  weights=None, ):
+                                  weights=None):
     train_pool, X_train_imputed = make_imputed_pool(X_train,
                                                     y=y_train,
                                                     imputer=imputer,
@@ -146,7 +153,8 @@ def run_exp_bayes_hyperparams_opt(X_train,
                                    eval_metric='AUC:hints=skip_train~false',
                                    learning_rate=params['learning_rate'],
                                    depth=params['depth'],
-                                   random_state=params['seed'])
+                                   random_state=params['seed'],
+                                   task_type=params['task_type'])
         training_res = model.fit(train_pool, eval_set=val_pool, verbose=False)
         auc = training_res.best_score_['validation']['AUC']
         return -auc  # The objective function is minimized
@@ -158,7 +166,8 @@ def run_exp_bayes_hyperparams_opt(X_train,
                                      eval_metric='AUC:hints=skip_train~false',
                                      **best,
                                      random_state=param_space['seed'],
-                                     train_dir=train_dir)
+                                     train_dir=train_dir,
+                                     task_type=param_space['task_type'])
     training_res = refit_model.fit(train_pool,
                                    eval_set=val_pool,
                                    verbose=False)
@@ -168,6 +177,7 @@ def run_exp_bayes_hyperparams_opt(X_train,
     print(f"Training: Log loss={training_res.best_score_['learn']['Logloss']}   ROC AUC={training_AUC}")
     print(
         f"Validation: Log loss={training_res.best_score_['validation']['Logloss']}   ROC AUC={training_res.best_score_['validation']['AUC']}")
+    print(f'Best iteration: {training_res.best_iteration_}')
     return refit_model
 
 
@@ -177,9 +187,12 @@ we use the train/val data sets
 Note: passing a CatBoost Pool() instance in the param_space values here below doesn't work, because hyperopt would
 throw an exception during optimization.'''
 param_space = {'learning_rate': hp.uniform('learning_rate', .01, .1),
-               'depth': hp.quniform('depth', 2, 8, 1),
+               'depth': hp.quniform('depth', 4, 12, 1),
+               'l2_leaf_reg': hp.uniform('l2_leaf_reg', 1, 9),
+               'bagging_temperature': hp.uniform('bagging_temperature', 0, 2),
                'seed': seed,  # hyperopt accepts constant value parameters
-               'iterations': iterations
+               'iterations': iterations,
+               'task_type': task_type
                }
 
 print('\nPerforming Bayesian search for hyper-parameters optimization, after dropping samples with missing data')
@@ -257,13 +270,14 @@ can be evaluated with x-evaluation by setting parameter `calc_cv_statistics` to 
 
 
 def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_grid, cv_folds, imputer=None,
-                                 train_dir=None):
+                                 train_dir=None, task_type='CPU'):
     dev_pool, X_inputed = make_imputed_pool(X, y, imputer, cat_features)
     model = CatBoostClassifier(iterations=iterations,
                                eval_metric='AUC:hints=skip_train~false',
                                cat_features=cat_features,
                                random_state=seed,
-                               train_dir=train_dir)
+                               train_dir=train_dir,
+                               task_type=task_type)
 
     grid_search_results = model.grid_search(X=dev_pool,
                                             param_grid=param_grid,
@@ -286,7 +300,7 @@ param_grid = {'learning_rate': np.arange(.01, .2, .01),
 
 # Count the number of hyper-parameter combinations in the grid
 n_grid_points = 1
-for param in param_grid:
+for _, param in param_grid.items():
     n_grid_points *= len(param)
 
 print('\nPerforming grid-search for hyper-parameters optimization while maintaining missing data')
@@ -300,16 +314,26 @@ run_exp_grid_hyperparams_opt(X=X_dev,
                              param_grid=param_grid,
                              cv_folds=cv_folds,
                              imputer=None,
-                             train_dir=str(logs_dir / 'catboost_logs_grid_search'))
+                             train_dir=str(logs_dir / 'catboost_logs_grid_search'),
+                             task_type=task_type)
 
 # Cross-validate the two selected models, and test them on the test set
+
+''' Make a new imputer for cross-validation over the dev set. It would be more correct to re-compute the imputer
+at every fold of cross-validation, but CatBoost() cv doesn't contemplate the possibility.
+'''
+
+dev_iter_imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=10, min_value=0, verbose=0)
+dev_iter_imputer.fit(X_dev)
+
 for model, descr, imputer in zip((selected_model, selected_model_imputed), ('without_imputation', 'with_imputation'),
-                                 (None, iter_imputer)):
+                                 (None, dev_iter_imputer)):
     print(f'\nCross-validating model {descr}.')
     params = model.get_params()
     params['loss_function'] = 'Logloss'
     params['eval_metric'] = 'AUC:hints=skip_train~false'
-    params['train_dir'] = str(logs_dir / ('catboost_logs_cv_'+descr) )
+    params['train_dir'] = str(logs_dir / ('catboost_logs_cv_' + descr))
+    params['task_type'] = task_type
     X_pool, _ = make_imputed_pool(X_dev, y_dev, imputer=imputer, cat_features=cat_features, weight=None)
     cv_results = cv(pool=X_pool,
                     params=params,
@@ -340,11 +364,11 @@ for model, descr, imputer in zip((selected_model, selected_model_imputed), ('wit
     print(
         f"Test (on test set): Log loss={training_res.best_score_['validation']['Logloss']}   ROC AUC={training_res.best_score_['validation']['AUC']}")
 
-''' TODO
+print(f'Overall run time: {round(time() - start_time)}s')
+
+''' TODO: misc
 Try Karpathy approach
-Try other tunable parameters https://catboost.ai/docs/concepts/parameter-tuning.html (also increase max tree depth to 16)
 Leverage Tensorboard
-How to display CatBoost charts outside of notebook? Is it possible?
 Explore Seaborne
 Use the whole HANES dataset from CDC, and also try with GPU
 Try other strategies for imputation based on mean encoding and similar
