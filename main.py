@@ -12,7 +12,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.experimental import enable_iterative_imputer
 from catboost import CatBoostClassifier, Pool, cv
 from sklearn.impute import IterativeImputer, SimpleImputer
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, log_loss
 from hyperopt import fmin, tpe, space_eval, hp
 from time import time
 
@@ -47,7 +47,7 @@ def make_imputed_pool(X, y, imputer, cat_features, weight=None):
 #############################################################################################################
 seed = 42  # For random numbers generation
 iterations = 20  # Max number of iterations at every run of gradien boosting (max number of trees built)
-hyper_iterations = 20  # Number of iterations required during each Bayesian optimization of hyper-parameters
+hyper_iterations = 30  # Number of iterations required during each Bayesian optimization of hyper-parameters
 cv_folds = 4  # Number of folds used for k-folds cross-validation
 logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
 task_type = 'GPU'  # Can be 'CPU' or 'GPU'
@@ -172,11 +172,15 @@ def run_exp_bayes_hyperparams_opt(X_train,
                                    eval_set=val_pool,
                                    verbose=False)
 
-    y_train_preds = refit_model.predict_proba(X_train)[:, 1]
-    training_AUC = roc_auc_score(y_train, y_train_preds)
-    print(f"Training: Log loss={training_res.best_score_['learn']['Logloss']}   ROC AUC={training_AUC}")
-    print(
-        f"Validation: Log loss={training_res.best_score_['validation']['Logloss']}   ROC AUC={training_res.best_score_['validation']['AUC']}")
+    best_val_iter = training_res.best_iteration_  # This is the best iter. based on the validation metric, ROC AUC
+    assert best_val_iter == np.argmax(training_res.evals_result_['validation']['AUC'])
+    # Collect metrics at the iteration with the best validation metric (the iteration where the model is shrunk to)
+    train_AUC = training_res.evals_result_['learn']['AUC'][best_val_iter]
+    train_Logloss = training_res.evals_result_['learn']['Logloss'][best_val_iter]
+    val_AUC = training_res.evals_result_['validation']['AUC'][best_val_iter]
+    val_Logloss = training_res.evals_result_['validation']['Logloss'][best_val_iter]
+    print(f"Training: Log loss={train_Logloss}   ROC AUC={train_AUC}")
+    print(f"Validation: Log loss={val_Logloss}   ROC AUC={val_AUC}")
     print(f'Best iteration: {training_res.best_iteration_}')
     return refit_model
 
@@ -186,7 +190,10 @@ we use the train/val data sets
 
 Note: passing a CatBoost Pool() instance in the param_space values here below doesn't work, because hyperopt would
 throw an exception during optimization.'''
-param_space = {'learning_rate': hp.uniform('learning_rate', .01, .1),
+
+############################################################################################################
+param_space = {'learning_rate': hp.loguniform('learning_rate', np.log(.001), np.log(.2)),
+               # 'learning_rate': hp.uniform('learning_rate', .01, .1),
                'depth': hp.quniform('depth', 4, 12, 1),
                'l2_leaf_reg': hp.uniform('l2_leaf_reg', 1, 9),
                'bagging_temperature': hp.uniform('bagging_temperature', 0, 2),
@@ -194,6 +201,7 @@ param_space = {'learning_rate': hp.uniform('learning_rate', .01, .1),
                'iterations': iterations,
                'task_type': task_type
                }
+############################################################################################################
 
 print('\nPerforming Bayesian search for hyper-parameters optimization, after dropping samples with missing data')
 
@@ -290,13 +298,14 @@ def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_gri
     best_iter = np.argmax(grid_search_results['cv_results']['test-AUC-mean'])
     best_AUC = grid_search_results['cv_results']['test-AUC-mean'][best_iter]
     loss_for_best_AUC = grid_search_results['cv_results']['test-Logloss-mean'][best_iter]
-    print('Best params', grid_search_results['params'], 'with AUC', best_AUC, 'obtained at iteration', best_iter,
-          'with Log loss', loss_for_best_AUC)
+    print('Best params', grid_search_results['params'])
+    print('Cross-validation: best AUC', best_AUC, 'obtained at iteration', best_iter,
+          'with log-loss', loss_for_best_AUC)
     return model
 
 
-param_grid = {'learning_rate': np.arange(.01, .2, .01),
-              'depth': list(range(2, 8))}
+param_grid = {'learning_rate': np.arange(.01, .2, .02),
+              'depth': list(range(6, 10))}
 
 # Count the number of hyper-parameter combinations in the grid
 n_grid_points = 1
@@ -338,7 +347,7 @@ for model, descr, imputer in zip((selected_model, selected_model_imputed), ('wit
     cv_results = cv(pool=X_pool,
                     params=params,
                     iterations=iterations,
-                    fold_count=4,
+                    fold_count=cv_folds,
                     partition_random_seed=seed,
                     stratified=True,
                     verbose=False)
@@ -348,25 +357,30 @@ for model, descr, imputer in zip((selected_model, selected_model_imputed), ('wit
     best_cv_val_Logloss = cv_results['test-Logloss-mean'][best_cv_iter]
     best_cv_train_AUC = cv_results['train-AUC-mean'][best_cv_iter]
     best_cv_train_Logloss = cv_results['train-Logloss-mean'][best_cv_iter]
-    print('Best validation with parameters', params, 'achieved at iteration', best_cv_iter)
+    print('Parameters:', params)
+    print('Best cross-validation achieved at iteration', best_cv_iter)
     print(f'Training: Logloss {best_cv_train_Logloss}   ROC AUC {best_cv_train_AUC}')
     print(f'Validation: Logloss {best_cv_val_Logloss}   ROC AUC {best_cv_val_AUC}')
 
-    print('Re-fitting the model and testing it')
-    test_pool, _ = make_imputed_pool(X_test, y_test, imputer=None, cat_features=cat_features, weight=None)
-    params['iterations'] = best_cv_iter + 1  # Shrink the model to the best iteration found during cross-validation
+    print('Re-fitting the model on the dev. set and testing it')
+    # Make a CatBoost Pool for the test set
+    # test_pool, _ = make_imputed_pool(X_test, y_test, imputer=None, cat_features=cat_features, weight=None)
+    # Shrink the model to the best iteration found during cross-validation
+    params['iterations'] = best_cv_iter + 1
+    params['train_dir'] = None
     cv_model = CatBoostClassifier(**params)
-    training_res = cv_model.fit(X_pool, eval_set=test_pool, verbose=False)
-    print('Iteration:', training_res.best_iteration_)
-    y_train_preds = cv_model.predict_proba(X_dev)[:, 1]
-    training_AUC = roc_auc_score(y_dev, y_train_preds)
-    print(f"Training (on dev. set): Log loss={training_res.best_score_['learn']['Logloss']}   ROC AUC={training_AUC}")
-    print(
-        f"Test (on test set): Log loss={training_res.best_score_['validation']['Logloss']}   ROC AUC={training_res.best_score_['validation']['AUC']}")
+    # training_res = cv_model.fit(X_pool, verbose=False)
+    training_res = cv_model.fit(X_pool, verbose=False)
+    # print('Iteration:', training_res.best_iteration_)
+    y_test_preds = cv_model.predict_proba(X_test)[:, 1]
+    test_AUC = roc_auc_score(y_test, y_test_preds)
+    test_Logloss = log_loss(y_test, y_test_preds)
+    print(f"Test on test set: Log loss={test_Logloss}   ROC AUC={test_AUC}")
 
 print(f'Overall run time: {round(time() - start_time)}s')
 
 ''' TODO: misc
+Use early stopping
 Try Karpathy approach
 Leverage Tensorboard
 Explore Seaborne

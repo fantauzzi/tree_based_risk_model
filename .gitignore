@@ -141,6 +141,7 @@ cython_debug/
 
 catboost_info
 catboost_logs/*
+catboost_logs*
 test.py
 C2M2_Assignment.ipynb
 C2_W2_lecture.ipynb
