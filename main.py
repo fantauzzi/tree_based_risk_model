@@ -1,3 +1,4 @@
+import matplotlib.pyplot as plt
 import shap
 import sklearn
 import pydotplus
@@ -6,34 +7,17 @@ import pandas as pd
 import seaborn as sns
 import shutil
 from pathlib import Path
-import matplotlib.pyplot as plt
 from IPython.display import Image
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import precision_recall_curve, roc_curve
 from sklearn.experimental import enable_iterative_imputer
-from catboost import CatBoostClassifier, Pool, cv
+from catboost import CatBoostClassifier, Pool, cv, EFstrType
 from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.metrics import roc_auc_score, log_loss
 from hyperopt import fmin, tpe, space_eval, hp
 from time import time
 
 from util import load_data
-
-
-def print_train_val_test_c_indices(classifier,
-                                   X_train,
-                                   y_train,
-                                   X_val,
-                                   y_val,
-                                   X_test,
-                                   y_test):
-    y_train_preds = classifier.predict_proba(X_train)[:, 1]
-    print(f'Train ROC AUC: {roc_auc_score(y_train, y_train_preds)}')
-
-    y_val_preds = classifier.predict_proba(X_val)[:, 1]
-    print(f'Val ROC AUC: {roc_auc_score(y_val, y_val_preds)}')
-
-    y_test_preds = classifier.predict_proba(X_test)[:, 1]
-    print(f'Test ROC AUC: {roc_auc_score(y_test, y_test_preds)}')
 
 
 def make_imputed_pool(X, y, imputer, cat_features, weight=None):
@@ -46,8 +30,8 @@ def make_imputed_pool(X, y, imputer, cat_features, weight=None):
 
 #############################################################################################################
 seed = 42  # For random numbers generation
-iterations = 20  # Max number of iterations at every run of gradien boosting (max number of trees built)
-hyper_iterations = 30  # Number of iterations required during each Bayesian optimization of hyper-parameters
+iterations = 10  # Max number of iterations at every run of gradien boosting (max number of trees built)
+hyper_iterations = 10  # Number of iterations required during each Bayesian optimization of hyper-parameters
 cv_folds = 4  # Number of folds used for k-folds cross-validation
 logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
 task_type = 'GPU'  # Can be 'CPU' or 'GPU'
@@ -121,7 +105,7 @@ def compute_weights(y):
     pos_weight = total_neg * len(y) / (2 * total_neg * total_pos)
     neg_weight = total_pos * len(y) / (2 * total_neg * total_pos)
     assert np.isclose(pos_weight * total_pos + neg_weight * total_neg, len(y))
-    w = np.full_like(y, neg_weight)
+    w = np.full_like(y, neg_weight, dtype=float)
     w[y == 1] = pos_weight
     return w, {'total_pos': total_pos, 'total_neg': total_neg, 'pos_weight': pos_weight, 'neg_weight': neg_weight}
 
@@ -377,10 +361,45 @@ for model, descr, imputer in zip((selected_model, selected_model_imputed), ('wit
     test_Logloss = log_loss(y_test, y_test_preds)
     print(f"Test on test set: Log loss={test_Logloss}   ROC AUC={test_AUC}")
 
-print(f'Overall run time: {round(time() - start_time)}s')
+print(f'Overall train, validation and test run time: {round(time() - start_time)}s')
+
+print('\nFetaures importance based on prediction values change (%)')
+model = selected_model
+X_pool, _ = make_imputed_pool(X_dev, y_dev, imputer=None, cat_features=cat_features, weight=None)
+feature_importances = model.get_feature_importance(X_pool)
+feature_names = X_dev.columns
+for score, name in sorted(zip(feature_importances, feature_names), reverse=True):
+    print('{}: {}'.format(name, score))
+
+print('\nFetaures importance based on loss (ROC AUC) values change')
+feature_importances_loss = model.get_feature_importance(X_pool, type=EFstrType.LossFunctionChange)
+for score, name in sorted(zip(feature_importances_loss, feature_names), reverse=True):
+    print('{}: {}'.format(name, score))
+y_test_preds = model.predict_proba(X_test)[:, 1]
+precision_curve, recall_curve, pr_thresholds = precision_recall_curve(y_test, y_test_preds)
+
+fig, ax = plt.subplots()
+ax.set_title('Precision and Recall to Threshold')
+ax.set_xlabel('Threshold')
+ax.set_ylabel('Precision')
+ax.set_ylim((0, 1))
+ax.grid(True)
+ax.set_ylim((0, 1))
+ax2 = ax.twinx()
+ax2.set_ylabel('Recall')
+ax2.set_ylim((0, 1))
+lns1 = ax.plot(pr_thresholds, precision_curve[:-1], color='blue', label='Precision')
+lns2 = ax2.plot(pr_thresholds, recall_curve[:-1], color='red', label='Recall')
+lns = lns1 + lns2
+labs = [l.get_label() for l in lns]
+ax2.legend(lns, labs, loc='lower center')
+plt.show()
 
 ''' TODO: misc
 Use early stopping
+Leverage the golden feature
+Add SHAP to the jupyter Notebook
+Plot how metrics change (specificity/sensitivity/etc) when changing the threshold
 Try Karpathy approach
 Leverage Tensorboard
 Explore Seaborne
