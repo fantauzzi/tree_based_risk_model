@@ -31,10 +31,11 @@ def make_imputed_pool(X, y, imputer, cat_features, weight=None):
 #############################################################################################################
 seed = 42  # For random numbers generation
 iterations = 10  # Max number of iterations at every run of gradien boosting (max number of trees built)
-hyper_iterations = 10  # Number of iterations required during each Bayesian optimization of hyper-parameters
+hyper_iterations = 20  # Number of iterations required during each Bayesian optimization of hyper-parameters
 cv_folds = 4  # Number of folds used for k-folds cross-validation
 logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
 task_type = 'GPU'  # Can be 'CPU' or 'GPU'
+early_stopping_rounds = 100
 #############################################################################################################
 
 start_time = time()
@@ -138,7 +139,8 @@ def run_exp_bayes_hyperparams_opt(X_train,
                                    learning_rate=params['learning_rate'],
                                    depth=params['depth'],
                                    random_state=params['seed'],
-                                   task_type=params['task_type'])
+                                   task_type=params['task_type'],
+                                   early_stopping_rounds=params['early_stopping_rounds'])
         training_res = model.fit(train_pool, eval_set=val_pool, verbose=False)
         auc = training_res.best_score_['validation']['AUC']
         return -auc  # The objective function is minimized
@@ -183,7 +185,9 @@ param_space = {'learning_rate': hp.loguniform('learning_rate', np.log(.001), np.
                'bagging_temperature': hp.uniform('bagging_temperature', 0, 2),
                'seed': seed,  # hyperopt accepts constant value parameters
                'iterations': iterations,
-               'task_type': task_type
+               'task_type': task_type,
+               'early_stopping_rounds': early_stopping_rounds,
+               # 'per_float_feature_quantization': ['0:border_count=1024']  # Feature 0 is Age
                }
 ############################################################################################################
 
@@ -262,14 +266,15 @@ can be evaluated with x-evaluation by setting parameter `calc_cv_statistics` to 
 
 
 def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_grid, cv_folds, imputer=None,
-                                 train_dir=None, task_type='CPU'):
+                                 early_stopping_rounds=None, train_dir=None, task_type='CPU'):
     dev_pool, X_inputed = make_imputed_pool(X, y, imputer, cat_features)
     model = CatBoostClassifier(iterations=iterations,
                                eval_metric='AUC:hints=skip_train~false',
                                cat_features=cat_features,
                                random_state=seed,
                                train_dir=train_dir,
-                               task_type=task_type)
+                               task_type=task_type,
+                               early_stopping_rounds=early_stopping_rounds)
 
     grid_search_results = model.grid_search(X=dev_pool,
                                             param_grid=param_grid,
@@ -307,6 +312,7 @@ run_exp_grid_hyperparams_opt(X=X_dev,
                              param_grid=param_grid,
                              cv_folds=cv_folds,
                              imputer=None,
+                             early_stopping_rounds=early_stopping_rounds,
                              train_dir=str(logs_dir / 'catboost_logs_grid_search'),
                              task_type=task_type)
 
@@ -319,91 +325,90 @@ at every fold of cross-validation, but CatBoost() cv doesn't contemplate the pos
 dev_iter_imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=10, min_value=0, verbose=0)
 dev_iter_imputer.fit(X_dev)
 
-for model, descr, imputer in zip((selected_model, selected_model_imputed), ('without_imputation', 'with_imputation'),
-                                 (None, dev_iter_imputer)):
-    print(f'\nCross-validating model {descr}.')
-    params = model.get_params()
-    params['loss_function'] = 'Logloss'
-    params['eval_metric'] = 'AUC:hints=skip_train~false'
-    params['train_dir'] = str(logs_dir / ('catboost_logs_cv_' + descr))
-    params['task_type'] = task_type
-    X_pool, _ = make_imputed_pool(X_dev, y_dev, imputer=imputer, cat_features=cat_features, weight=None)
-    cv_results = cv(pool=X_pool,
-                    params=params,
-                    iterations=iterations,
-                    fold_count=cv_folds,
-                    partition_random_seed=seed,
-                    stratified=True,
-                    verbose=False)
-    # Find the iteration with the best test AUC, its AUC and other train and test stats.
-    best_cv_iter = np.argmax(cv_results['test-AUC-mean'])  # All the stats retrieved will refer to this same iteration
-    best_cv_val_AUC = cv_results['test-AUC-mean'][best_cv_iter]
-    best_cv_val_Logloss = cv_results['test-Logloss-mean'][best_cv_iter]
-    best_cv_train_AUC = cv_results['train-AUC-mean'][best_cv_iter]
-    best_cv_train_Logloss = cv_results['train-Logloss-mean'][best_cv_iter]
-    print('Parameters:', params)
-    print('Best cross-validation achieved at iteration', best_cv_iter)
-    print(f'Training: Logloss {best_cv_train_Logloss}   ROC AUC {best_cv_train_AUC}')
-    print(f'Validation: Logloss {best_cv_val_Logloss}   ROC AUC {best_cv_val_AUC}')
+model = selected_model
+imputer = None
 
-    print('Re-fitting the model on the dev. set and testing it')
-    # Make a CatBoost Pool for the test set
-    # test_pool, _ = make_imputed_pool(X_test, y_test, imputer=None, cat_features=cat_features, weight=None)
-    # Shrink the model to the best iteration found during cross-validation
-    params['iterations'] = best_cv_iter + 1
-    params['train_dir'] = None
-    cv_model = CatBoostClassifier(**params)
-    # training_res = cv_model.fit(X_pool, verbose=False)
-    training_res = cv_model.fit(X_pool, verbose=False)
-    # print('Iteration:', training_res.best_iteration_)
-    y_test_preds = cv_model.predict_proba(X_test)[:, 1]
-    test_AUC = roc_auc_score(y_test, y_test_preds)
-    test_Logloss = log_loss(y_test, y_test_preds)
-    print(f"Test on test set: Log loss={test_Logloss}   ROC AUC={test_AUC}")
+print(f'\nCross-validating selected model.')
+params = model.get_params()
+params['loss_function'] = 'Logloss'
+params['eval_metric'] = 'AUC:hints=skip_train~false'
+params['train_dir'] = str(logs_dir / ('catboost_logs_cv_selected'))
+params['task_type'] = task_type
+params['early_stopping_rounds'] = early_stopping_rounds
+# params['per_float_feature_quantization'] = ['0:border_count=1024']
+X_pool, _ = make_imputed_pool(X_dev, y_dev, imputer=imputer, cat_features=cat_features, weight=None)
+cv_results = cv(pool=X_pool,
+                params=params,
+                iterations=iterations,
+                fold_count=cv_folds,
+                partition_random_seed=seed,
+                stratified=True,
+                verbose=False)
+# Find the iteration with the best test AUC, its AUC and other train and test stats.
+best_cv_iter = np.argmax(cv_results['test-AUC-mean'])  # All the stats retrieved will refer to this same iteration
+best_cv_val_AUC = cv_results['test-AUC-mean'][best_cv_iter]
+best_cv_val_Logloss = cv_results['test-Logloss-mean'][best_cv_iter]
+best_cv_train_AUC = cv_results['train-AUC-mean'][best_cv_iter]
+best_cv_train_Logloss = cv_results['train-Logloss-mean'][best_cv_iter]
+print('Parameters:')
+for key, value in sorted(params.items()):
+    print(f'   {key}={value}')
+print('Best cross-validation achieved at iteration', best_cv_iter)
+print(f'Training: Logloss {best_cv_train_Logloss}   ROC AUC {best_cv_train_AUC}')
+print(f'Validation: Logloss {best_cv_val_Logloss}   ROC AUC {best_cv_val_AUC}')
+
+print('Re-fitting the model on the dev. set and testing it')
+# Make a CatBoost Pool for the test set
+# test_pool, _ = make_imputed_pool(X_test, y_test, imputer=None, cat_features=cat_features, weight=None)
+# Shrink the model to the best iteration found during cross-validation
+params['iterations'] = best_cv_iter + 1
+params['train_dir'] = None
+cv_model = CatBoostClassifier(**params)
+# training_res = cv_model.fit(X_pool, verbose=False)
+training_res = cv_model.fit(X_pool, verbose=False)
+# print('Iteration:', training_res.best_iteration_)
+y_test_preds = cv_model.predict_proba(X_test)[:, 1]
+test_AUC = roc_auc_score(y_test, y_test_preds)
+test_Logloss = log_loss(y_test, y_test_preds)
+print(f"Test on test set: Log loss={test_Logloss}   ROC AUC={test_AUC}")
 
 print(f'Overall train, validation and test run time: {round(time() - start_time)}s')
 
 print('\nFetaures importance based on prediction values change (%)')
-model = selected_model
-X_pool, _ = make_imputed_pool(X_dev, y_dev, imputer=None, cat_features=cat_features, weight=None)
-feature_importances = model.get_feature_importance(X_pool)
+feature_importances = cv_model.get_feature_importance(X_pool)
 feature_names = X_dev.columns
 for score, name in sorted(zip(feature_importances, feature_names), reverse=True):
     print('{}: {}'.format(name, score))
 
 print('\nFetaures importance based on loss (ROC AUC) values change')
-feature_importances_loss = model.get_feature_importance(X_pool, type=EFstrType.LossFunctionChange)
+feature_importances_loss = cv_model.get_feature_importance(X_pool, type=EFstrType.LossFunctionChange)
 for score, name in sorted(zip(feature_importances_loss, feature_names), reverse=True):
     print('{}: {}'.format(name, score))
-y_test_preds = model.predict_proba(X_test)[:, 1]
-precision_curve, recall_curve, pr_thresholds = precision_recall_curve(y_test, y_test_preds)
 
+# Plot a ROC curve for the x-validated model over the test set
+y_test_preds = cv_model.predict_proba(X_test)[:, 1]
+# precision_curve, recall_curve, pr_thresholds = precision_recall_curve(y_test, y_test_preds)
+fpr, tpr, thresholds = roc_curve(y_test, y_test_preds)
 fig, ax = plt.subplots()
-ax.set_title('Precision and Recall to Threshold')
-ax.set_xlabel('Threshold')
-ax.set_ylabel('Precision')
+ax.set_title('ROC Curve')
+ax.set_xlabel('False positive rate')
+ax.set_ylabel('True Positive rate')
 ax.set_ylim((0, 1))
+ax.set_xlim((0, 1))
 ax.grid(True)
-ax.set_ylim((0, 1))
-ax2 = ax.twinx()
-ax2.set_ylabel('Recall')
-ax2.set_ylim((0, 1))
-lns1 = ax.plot(pr_thresholds, precision_curve[:-1], color='blue', label='Precision')
-lns2 = ax2.plot(pr_thresholds, recall_curve[:-1], color='red', label='Recall')
-lns = lns1 + lns2
-labs = [l.get_label() for l in lns]
-ax2.legend(lns, labs, loc='lower center')
+plt.gca().set_aspect('equal', adjustable='box')
+ax.plot([0, 1], [0, 1], color='blue', ls='--', lw=.5)
+ax.plot(fpr, tpr, color='blue', label='ROC')
+# ax.legend(loc='lower center')
 plt.show()
 
 ''' TODO: misc
-Use early stopping
-Leverage the golden feature
+Fix the proliferation of parameters passed to grid search
 Add SHAP to the jupyter Notebook
-Plot how metrics change (specificity/sensitivity/etc) when changing the threshold
 Try Karpathy approach
 Leverage Tensorboard
 Explore Seaborne
-Use the whole HANES dataset from CDC, and also try with GPU
+Use the whole HANES dataset from CDC or another survivale dataset e.g. https://archive.ics.uci.edu/ml/datasets/HCC+Survival
 Try other strategies for imputation based on mean encoding and similar
 Instead of checking if survival after 10 years, estimate the number of years of survival
 C-index is the same as the ROC AUC for logistic regression.
