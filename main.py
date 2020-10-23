@@ -1,6 +1,4 @@
 import matplotlib.pyplot as plt
-import shap
-import sklearn
 import pydotplus
 import numpy as np
 import pandas as pd
@@ -14,7 +12,8 @@ from sklearn.experimental import enable_iterative_imputer
 from catboost import CatBoostClassifier, Pool, cv, EFstrType
 from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.metrics import roc_auc_score, log_loss
-from hyperopt import fmin, tpe, space_eval, hp
+from sklearn.linear_model import LogisticRegression
+from hyperopt import fmin, tpe, hp
 from time import time
 
 from util import load_data
@@ -32,6 +31,7 @@ def make_imputed_pool(X, y, imputer, cat_features, weight=None):
 seed = 42  # For random numbers generation
 iterations = 10  # Max number of iterations at every run of gradien boosting (max number of trees built)
 hyper_iterations = 20  # Number of iterations required during each Bayesian optimization of hyper-parameters
+log_regs_hyper_iterations = 10  # Number of iterations for hyper-parameters optimization for logistic regression
 cv_folds = 4  # Number of folds used for k-folds cross-validation
 logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
 task_type = 'GPU'  # Can be 'CPU' or 'GPU'
@@ -87,6 +87,53 @@ iter_imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_i
 iter_imputer.fit(X_train)
 
 cat_features = [3, 11]  # Categorical features are race and sex
+
+# Build dataset with categorical variables one-hot encoded for logistic regression
+
+X_train_imputed_for_1_hot = pd.DataFrame(iter_imputer.transform(X_train), columns=X_train.columns)
+X_train_imputed_for_1_hot = X_train_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
+X_val_imputed_for_1_hot = pd.DataFrame(iter_imputer.transform(X_val), columns=X_val.columns)
+X_val_imputed_for_1_hot = X_val_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
+
+print('\nFitting logistic regression with iterative imputation')
+X_train_1_hot = pd.get_dummies(X_train_imputed_for_1_hot, columns=['Sex', 'Race'])
+X_val_1_hot = pd.get_dummies(X_val_imputed_for_1_hot, columns=['Sex', 'Race'])
+
+
+def objective(params):
+    log_regr_model = LogisticRegression(**params)
+    log_regr_model.fit(X_train_1_hot, y_train)
+    y_log_regr_pred = log_regr_model.predict_proba(X_val_1_hot)[:, 1]
+    log_regr_auc = roc_auc_score(y_val, y_log_regr_pred)
+    return -log_regr_auc  # Hyperopt optimizes for minimum
+
+
+log_regr_params = {'penalty': 'elasticnet',
+                   'C': hp.uniform('C', .25, 4),
+                   'class_weight': None,
+                   'random_state': seed,
+                   'solver': 'saga',
+                   'max_iter': 10000,
+                   'multi_class': 'ovr',
+                   'n_jobs': -1,
+                   'l1_ratio': hp.uniform('l1_ratio', .0, 1)}
+
+rstate = np.random.RandomState(seed)
+best_log_reg_params = fmin(fn=objective,
+                           space=log_regr_params,
+                           algo=tpe.suggest,
+                           max_evals=log_regs_hyper_iterations,
+                           rstate=rstate)
+all_best_log_reg_params = log_regr_params
+for key, value in best_log_reg_params.items():
+    all_best_log_reg_params[key] = value
+
+log_regr_model = LogisticRegression(**all_best_log_reg_params)
+log_regr_model.fit(X_train_1_hot, y_train)
+y_log_regr_pred = log_regr_model.predict_proba(X_val_1_hot)[:, 1]
+log_regr_auc = roc_auc_score(y_val, y_log_regr_pred)
+print('Best model found has parameters', best_log_reg_params)
+print(f'Validation AUC is {log_regr_auc} achieved in {log_regr_model.n_iter_} iterations')
 
 
 def compute_weights(y):
@@ -318,13 +365,6 @@ run_exp_grid_hyperparams_opt(X=X_dev,
 
 # Cross-validate the two selected models, and test them on the test set
 
-''' Make a new imputer for cross-validation over the dev set. It would be more correct to re-compute the imputer
-at every fold of cross-validation, but CatBoost() cv doesn't contemplate the possibility.
-'''
-
-dev_iter_imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=10, min_value=0, verbose=0)
-dev_iter_imputer.fit(X_dev)
-
 model = selected_model
 imputer = None
 
@@ -335,7 +375,7 @@ params['eval_metric'] = 'AUC:hints=skip_train~false'
 params['train_dir'] = str(logs_dir / ('catboost_logs_cv_selected'))
 params['task_type'] = task_type
 params['early_stopping_rounds'] = early_stopping_rounds
-# params['per_float_feature_quantization'] = ['0:border_count=1024']
+''' Make a new imputer for cross-validation over the dev set. '''
 X_pool, _ = make_imputed_pool(X_dev, y_dev, imputer=imputer, cat_features=cat_features, weight=None)
 cv_results = cv(pool=X_pool,
                 params=params,
@@ -358,9 +398,6 @@ print(f'Training: Logloss {best_cv_train_Logloss}   ROC AUC {best_cv_train_AUC}'
 print(f'Validation: Logloss {best_cv_val_Logloss}   ROC AUC {best_cv_val_AUC}')
 
 print('Re-fitting the model on the dev. set and testing it')
-# Make a CatBoost Pool for the test set
-# test_pool, _ = make_imputed_pool(X_test, y_test, imputer=None, cat_features=cat_features, weight=None)
-# Shrink the model to the best iteration found during cross-validation
 params['iterations'] = best_cv_iter + 1
 params['train_dir'] = None
 cv_model = CatBoostClassifier(**params)
@@ -387,7 +424,6 @@ for score, name in sorted(zip(feature_importances_loss, feature_names), reverse=
 
 # Plot a ROC curve for the x-validated model over the test set
 y_test_preds = cv_model.predict_proba(X_test)[:, 1]
-# precision_curve, recall_curve, pr_thresholds = precision_recall_curve(y_test, y_test_preds)
 fpr, tpr, thresholds = roc_curve(y_test, y_test_preds)
 fig, ax = plt.subplots()
 ax.set_title('ROC Curve')
@@ -406,10 +442,8 @@ plt.show()
 Fix the proliferation of parameters passed to grid search
 Add SHAP to the jupyter Notebook
 Try Karpathy approach
-Leverage Tensorboard
 Explore Seaborne
 Use the whole HANES dataset from CDC or another survivale dataset e.g. https://archive.ics.uci.edu/ml/datasets/HCC+Survival
-Try other strategies for imputation based on mean encoding and similar
 Instead of checking if survival after 10 years, estimate the number of years of survival
 C-index is the same as the ROC AUC for logistic regression.
    see https://www.statisticshowto.com/c-statistic/#:~:text=A%20weighted%20c-index%20is,correctly%20predicting%20a%20negative%20outcome
