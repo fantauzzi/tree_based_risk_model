@@ -205,11 +205,29 @@ def run_exp_grid_hyperparams_opt(X,
     return model
 
 
+def run_exp_sanity_check(X_train,
+                         y_train,
+                         max_evals,
+                         train_dir='None',
+                         task_type='CPU',
+                         seed=None):
+    model = CatBoostClassifier(iterations=max_evals,
+                               random_state=seed,
+                               task_type=task_type,
+                               train_dir=train_dir,
+                               custom_metric='AUC', )
+    model.fit(X_train, y_train, verbose=False)
+    scores = model.get_best_score()['learn']
+    print(f"Final Logloss {scores['Logloss']}   final AUC {scores['AUC']}")
+
+    return model
+
+
 def main():
     #############################################################################################################
     seed = 42  # For random numbers generation
-    iterations = 100  # Max number of iterations at every run of gradien boosting (max number of trees built)
-    hyper_iterations = 10  # Number of iterations required during each Bayesian optimization of hyper-parameters
+    iterations = 200  # Max number of iterations at every run of gradien boosting (max number of trees built)
+    hyper_iterations = 20  # Number of iterations required during each Bayesian optimization of hyper-parameters
     log_regs_hyper_iterations = 2  # Number of iterations for hyper-parameters optimization for logistic regression
     cv_folds = 4  # Number of folds used for k-folds cross-validation
     logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
@@ -227,8 +245,23 @@ def main():
 
     # Load the NHANES I epidemiology dataset
     X_dev, X_test, y_dev, y_test = load_data(10)
+
     # X_dev = X_dev.sample(n=1000, random_state=seed)
     # y_dev = y_dev.loc[X_dev.index]
+
+    X_sanity = X_dev.dropna(axis='rows')
+    y_sanity = y_dev.loc[X_sanity.index]
+    X_sanity = pd.concat(
+        [X_sanity[y_sanity == 1].sample(n=50, random_state=seed),
+         X_sanity[y_sanity == 0].sample(n=50, random_state=seed)])
+    y_sanity = y_sanity.loc[X_sanity.index]
+    print('\nRunning sanity check')
+    run_exp_sanity_check(X_sanity,
+                         y_sanity,
+                         max_evals=1000,
+                         task_type=task_type,
+                         seed=seed,
+                         train_dir=str(logs_dir / 'catboost_logs_sanity'))
 
     # Convert categorical features from float to int, as that is what CatBoost expects
     X_dev = X_dev.astype({'Sex': int, 'Race': int})
@@ -239,7 +272,7 @@ def main():
     dev_missing_count = count_samples_with_missing_data(X_dev)
     test_missing_count = count_samples_with_missing_data(X_test)
 
-    print('Dev. set missing data in', dev_missing_count, 'samples out of', len(X_dev))
+    print('\nDev. set missing data in', dev_missing_count, 'samples out of', len(X_dev))
     print('Test set missing data in', test_missing_count, 'samples out of', len(X_test))
 
     # Split the dev set into training and validation. The latter will be used for hyper-parameters tuning.
@@ -481,19 +514,16 @@ def main():
     # ax.legend(loc='lower center')
     plt.show()
 
-    ''' TODO: misc
-    Set the matplotlib backend
-    Try Karpathy approach, e.g. small batch to drive the loss to 0
-    Add SHAP to the jupyter Notebook
-    Explore Seaborne
-    Use the whole HANES dataset from CDC or another survivale dataset e.g. https://archive.ics.uci.edu/ml/datasets/HCC+Survival
-    Instead of checking if survival after 10 years, estimate the number of years of survival
-    C-index is the same as the ROC AUC for logistic regression.
-       see https://www.statisticshowto.com/c-statistic/#:~:text=A%20weighted%20c-index%20is,correctly%20predicting%20a%20negative%20outcome
-       and also https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4886856/  and https://bit.ly/3dvUh07
-
-    '''
-
 
 if __name__ == '__main__':
     main()
+
+''' TODO: misc
+Add SHAP to the jupyter Notebook
+Use the whole HANES dataset from CDC or another survivale dataset e.g. https://archive.ics.uci.edu/ml/datasets/HCC+Survival explore Seaborne for preliminary data analysis
+Instead of checking if survival after 10 years, estimate the number of years of survival
+C-index is the same as the ROC AUC for logistic regression.
+   see https://www.statisticshowto.com/c-statistic/#:~:text=A%20weighted%20c-index%20is,correctly%20predicting%20a%20negative%20outcome
+   and also https://www.ncbi.nlm.nih.gov/pmc/articles/PMC4886856/  and https://bit.ly/3dvUh07
+
+'''
