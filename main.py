@@ -29,13 +29,13 @@ def make_imputed_pool(X, y, imputer, cat_features, weight=None):
 
 #############################################################################################################
 seed = 42  # For random numbers generation
-iterations = 10  # Max number of iterations at every run of gradien boosting (max number of trees built)
-hyper_iterations = 20  # Number of iterations required during each Bayesian optimization of hyper-parameters
-log_regs_hyper_iterations = 10  # Number of iterations for hyper-parameters optimization for logistic regression
+iterations = 100  # Max number of iterations at every run of gradien boosting (max number of trees built)
+hyper_iterations = 10  # Number of iterations required during each Bayesian optimization of hyper-parameters
+log_regs_hyper_iterations = 2  # Number of iterations for hyper-parameters optimization for logistic regression
 cv_folds = 4  # Number of folds used for k-folds cross-validation
 logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
 task_type = 'GPU'  # Can be 'CPU' or 'GPU'
-early_stopping_rounds = 100
+early_stopping_iters = 10000  # Effectively disabled, as there is an issue with displaying the charts see https://github.com/catboost/catboost/issues/1468
 #############################################################################################################
 
 start_time = time()
@@ -48,6 +48,8 @@ for item in logs_dir.iterdir():
 
 # Load the NHANES I epidemiology dataset
 X_dev, X_test, y_dev, y_test = load_data(10)
+# X_dev = X_dev.sample(n=1000, random_state=seed)
+# y_dev = y_dev.loc[X_dev.index]
 
 # Convert categorical features from float to int, as that is what CatBoost expects
 X_dev = X_dev.astype({'Sex': int, 'Race': int})
@@ -86,26 +88,48 @@ mean_imputer.fit(X_train)
 iter_imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=10, min_value=0, verbose=0)
 iter_imputer.fit(X_train)
 
-cat_features = [3, 11]  # Categorical features are race and sex
 
-# Build dataset with categorical variables one-hot encoded for logistic regression
+def run_exp_log_regr(X_train,
+                     y_train,
+                     X_val,
+                     y_val,
+                     param_space,
+                     max_evals,
+                     imputer):
+    # Build dataset with categorical variables one-hot encoded for logistic regression
+    X_train_imputed_for_1_hot = pd.DataFrame(imputer.transform(X_train), columns=X_train.columns)
+    X_train_imputed_for_1_hot = X_train_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
+    X_val_imputed_for_1_hot = pd.DataFrame(imputer.transform(X_val), columns=X_val.columns)
+    X_val_imputed_for_1_hot = X_val_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
 
-X_train_imputed_for_1_hot = pd.DataFrame(iter_imputer.transform(X_train), columns=X_train.columns)
-X_train_imputed_for_1_hot = X_train_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
-X_val_imputed_for_1_hot = pd.DataFrame(iter_imputer.transform(X_val), columns=X_val.columns)
-X_val_imputed_for_1_hot = X_val_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
+    print('\nFitting logistic regression with iterative imputation')
+    X_train_1_hot = pd.get_dummies(X_train_imputed_for_1_hot, columns=['Sex', 'Race'])
+    X_val_1_hot = pd.get_dummies(X_val_imputed_for_1_hot, columns=['Sex', 'Race'])
 
-print('\nFitting logistic regression with iterative imputation')
-X_train_1_hot = pd.get_dummies(X_train_imputed_for_1_hot, columns=['Sex', 'Race'])
-X_val_1_hot = pd.get_dummies(X_val_imputed_for_1_hot, columns=['Sex', 'Race'])
+    def objective(params):
+        log_regr_model = LogisticRegression(**params)
+        log_regr_model.fit(X_train_1_hot, y_train)
+        y_log_regr_pred = log_regr_model.predict_proba(X_val_1_hot)[:, 1]
+        log_regr_auc = roc_auc_score(y_val, y_log_regr_pred)
+        return -log_regr_auc  # Hyperopt optimizes for minimum
 
+    rstate = np.random.RandomState(seed)
+    best_log_reg_params = fmin(fn=objective,
+                               space=param_space,
+                               algo=tpe.suggest,
+                               max_evals=max_evals,
+                               rstate=rstate)
+    all_best_log_reg_params = param_space
+    for key, value in best_log_reg_params.items():
+        all_best_log_reg_params[key] = value
 
-def objective(params):
-    log_regr_model = LogisticRegression(**params)
+    log_regr_model = LogisticRegression(**all_best_log_reg_params)
     log_regr_model.fit(X_train_1_hot, y_train)
     y_log_regr_pred = log_regr_model.predict_proba(X_val_1_hot)[:, 1]
     log_regr_auc = roc_auc_score(y_val, y_log_regr_pred)
-    return -log_regr_auc  # Hyperopt optimizes for minimum
+    print('Best model found has parameters', best_log_reg_params)
+    print(f'Validation AUC is {log_regr_auc} achieved in {log_regr_model.n_iter_[0]} iterations')
+    return log_regr_model
 
 
 log_regr_params = {'penalty': 'elasticnet',
@@ -118,22 +142,15 @@ log_regr_params = {'penalty': 'elasticnet',
                    'n_jobs': -1,
                    'l1_ratio': hp.uniform('l1_ratio', .0, 1)}
 
-rstate = np.random.RandomState(seed)
-best_log_reg_params = fmin(fn=objective,
-                           space=log_regr_params,
-                           algo=tpe.suggest,
-                           max_evals=log_regs_hyper_iterations,
-                           rstate=rstate)
-all_best_log_reg_params = log_regr_params
-for key, value in best_log_reg_params.items():
-    all_best_log_reg_params[key] = value
+run_exp_log_regr(X_train,
+                 y_train,
+                 X_val,
+                 y_val,
+                 param_space=log_regr_params,
+                 max_evals=log_regs_hyper_iterations,
+                 imputer=iter_imputer)
 
-log_regr_model = LogisticRegression(**all_best_log_reg_params)
-log_regr_model.fit(X_train_1_hot, y_train)
-y_log_regr_pred = log_regr_model.predict_proba(X_val_1_hot)[:, 1]
-log_regr_auc = roc_auc_score(y_val, y_log_regr_pred)
-print('Best model found has parameters', best_log_reg_params)
-print(f'Validation AUC is {log_regr_auc} achieved in {log_regr_model.n_iter_} iterations')
+cat_features = [3, 11]  # Categorical features are race and sex
 
 
 def compute_weights(y):
@@ -187,7 +204,9 @@ def run_exp_bayes_hyperparams_opt(X_train,
                                    depth=params['depth'],
                                    random_state=params['seed'],
                                    task_type=params['task_type'],
-                                   early_stopping_rounds=params['early_stopping_rounds'])
+                                   # early_stopping_rounds = params['early_stopping_rounds'],
+                                   od_type=params['od_type'],
+                                   od_wait=params['od_wait'])
         training_res = model.fit(train_pool, eval_set=val_pool, verbose=False)
         auc = training_res.best_score_['validation']['AUC']
         return -auc  # The objective function is minimized
@@ -200,7 +219,9 @@ def run_exp_bayes_hyperparams_opt(X_train,
                                      **best,
                                      random_state=param_space['seed'],
                                      train_dir=train_dir,
-                                     task_type=param_space['task_type'])
+                                     task_type=param_space['task_type'],
+                                     od_type=param_space['od_type'],
+                                     od_wait=param_space['od_wait'])
     training_res = refit_model.fit(train_pool,
                                    eval_set=val_pool,
                                    verbose=False)
@@ -233,8 +254,9 @@ param_space = {'learning_rate': hp.loguniform('learning_rate', np.log(.001), np.
                'seed': seed,  # hyperopt accepts constant value parameters
                'iterations': iterations,
                'task_type': task_type,
-               'early_stopping_rounds': early_stopping_rounds,
-               # 'per_float_feature_quantization': ['0:border_count=1024']  # Feature 0 is Age
+               # 'early_stopping_rounds': True,
+               'od_type': 'Iter',
+               'od_wait': early_stopping_iters
                }
 ############################################################################################################
 
@@ -312,8 +334,17 @@ Once method grid_search() has selected the best combination of hyper-parameters,
 can be evaluated with x-evaluation by setting parameter `calc_cv_statistics` to True (default). '''
 
 
-def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_grid, cv_folds, imputer=None,
-                                 early_stopping_rounds=None, train_dir=None, task_type='CPU'):
+def run_exp_grid_hyperparams_opt(X,
+                                 y,
+                                 cat_features,
+                                 seed,
+                                 iterations,
+                                 param_grid,
+                                 cv_folds,
+                                 early_stopping_iters,
+                                 imputer=None,
+                                 train_dir=None,
+                                 task_type='CPU'):
     dev_pool, X_inputed = make_imputed_pool(X, y, imputer, cat_features)
     model = CatBoostClassifier(iterations=iterations,
                                eval_metric='AUC:hints=skip_train~false',
@@ -321,7 +352,9 @@ def run_exp_grid_hyperparams_opt(X, y, cat_features, seed, iterations, param_gri
                                random_state=seed,
                                train_dir=train_dir,
                                task_type=task_type,
-                               early_stopping_rounds=early_stopping_rounds)
+                               # early_stopping_rounds=True,
+                               od_type='Iter',
+                               od_wait=early_stopping_iters)
 
     grid_search_results = model.grid_search(X=dev_pool,
                                             param_grid=param_grid,
@@ -359,7 +392,7 @@ run_exp_grid_hyperparams_opt(X=X_dev,
                              param_grid=param_grid,
                              cv_folds=cv_folds,
                              imputer=None,
-                             early_stopping_rounds=early_stopping_rounds,
+                             early_stopping_iters=early_stopping_iters,
                              train_dir=str(logs_dir / 'catboost_logs_grid_search'),
                              task_type=task_type)
 
@@ -374,7 +407,9 @@ params['loss_function'] = 'Logloss'
 params['eval_metric'] = 'AUC:hints=skip_train~false'
 params['train_dir'] = str(logs_dir / ('catboost_logs_cv_selected'))
 params['task_type'] = task_type
-params['early_stopping_rounds'] = early_stopping_rounds
+# params['early_stopping_rounds'] = True
+params['od_type'] = 'Iter'
+params['od_wait'] = early_stopping_iters
 ''' Make a new imputer for cross-validation over the dev set. '''
 X_pool, _ = make_imputed_pool(X_dev, y_dev, imputer=imputer, cat_features=cat_features, weight=None)
 cv_results = cv(pool=X_pool,
@@ -439,9 +474,11 @@ ax.plot(fpr, tpr, color='blue', label='ROC')
 plt.show()
 
 ''' TODO: misc
-Fix the proliferation of parameters passed to grid search
+Fix the early termination issue
+Throw in a proper main()
+Set the matplotlib backend
+Try Karpathy approach, e.g. small batch to drive the loss to 0
 Add SHAP to the jupyter Notebook
-Try Karpathy approach
 Explore Seaborne
 Use the whole HANES dataset from CDC or another survivale dataset e.g. https://archive.ics.uci.edu/ml/datasets/HCC+Survival
 Instead of checking if survival after 10 years, estimate the number of years of survival
