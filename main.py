@@ -16,6 +16,7 @@ from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.metrics import roc_auc_score, log_loss
 from sklearn.linear_model import LogisticRegression
 from hyperopt import fmin, tpe, hp
+import tensorflow as tf
 from time import time
 
 from util import load_data
@@ -27,6 +28,43 @@ def make_imputed_pool(X, y, imputer, cat_features, weight=None):
     X_imputed = X_imputed.astype({'Sex': int, 'Race': int})
     pool = Pool(data=X_imputed, label=y, cat_features=cat_features, weight=weight)
     return pool, X_imputed
+
+
+def run_exp_nn(X_train,
+               y_train,
+               X_val,
+               y_val,
+               param_space,
+               max_evals,
+               imputer,
+               seed):
+    X_train_imputed_for_1_hot = pd.DataFrame(imputer.transform(X_train), columns=X_train.columns)
+    X_train_imputed_for_1_hot = X_train_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
+    X_val_imputed_for_1_hot = pd.DataFrame(imputer.transform(X_val), columns=X_val.columns)
+    X_val_imputed_for_1_hot = X_val_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
+
+    print('\nFitting logistic regression with iterative imputation')
+    X_train_1_hot = pd.get_dummies(X_train_imputed_for_1_hot, columns=['Sex', 'Race'])
+    X_val_1_hot = pd.get_dummies(X_val_imputed_for_1_hot, columns=['Sex', 'Race'])
+    n_vars = len(X_train_1_hot.columns)
+
+    tf.random.set_seed(seed)
+    model = tf.keras.Sequential([
+        tf.keras.layers.Dense(n_vars, activation='relu', input_shape=(n_vars,)),
+        tf.keras.layers.Dense(1, activation='sigmoid')  # TF unable to compute metric AUC if activation here is linear
+    ])
+
+    model.compile(optimizer=tf.keras.optimizers.Adam(),
+                  loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
+                  metrics=[tf.keras.metrics.AUC()])
+    print(model.summary())
+    model.fit(X_train_1_hot,
+              y_train,
+              # validation_data=(X_val_1_hot, y_val),
+              epochs=100,
+              batch_size=64)
+
+    # TODO Check https://github.com/tensorflow/tensorflow/issues/36465
 
 
 def run_exp_log_regr(X_train,
@@ -226,9 +264,9 @@ def run_exp_sanity_check(X_train,
 def main():
     #############################################################################################################
     seed = 42  # For random numbers generation
-    iterations = 200  # Max number of iterations at every run of gradien boosting (max number of trees built)
-    hyper_iterations = 20  # Number of iterations required during each Bayesian optimization of hyper-parameters
-    log_regs_hyper_iterations = 2  # Number of iterations for hyper-parameters optimization for logistic regression
+    iterations = 300  # Max number of iterations at every run of gradien boosting (max number of trees built)
+    hyper_iterations = 100  # Number of iterations required during each Bayesian optimization of hyper-parameters
+    log_regs_hyper_iterations = 10  # Number of iterations for hyper-parameters optimization for logistic regression
     cv_folds = 4  # Number of folds used for k-folds cross-validation
     logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
     task_type = 'GPU'  # Can be 'CPU' or 'GPU'
@@ -245,23 +283,6 @@ def main():
 
     # Load the NHANES I epidemiology dataset
     X_dev, X_test, y_dev, y_test = load_data(10)
-
-    # X_dev = X_dev.sample(n=1000, random_state=seed)
-    # y_dev = y_dev.loc[X_dev.index]
-
-    X_sanity = X_dev.dropna(axis='rows')
-    y_sanity = y_dev.loc[X_sanity.index]
-    X_sanity = pd.concat(
-        [X_sanity[y_sanity == 1].sample(n=50, random_state=seed),
-         X_sanity[y_sanity == 0].sample(n=50, random_state=seed)])
-    y_sanity = y_sanity.loc[X_sanity.index]
-    print('\nRunning sanity check')
-    run_exp_sanity_check(X_sanity,
-                         y_sanity,
-                         max_evals=1000,
-                         task_type=task_type,
-                         seed=seed,
-                         train_dir=str(logs_dir / 'catboost_logs_sanity'))
 
     # Convert categorical features from float to int, as that is what CatBoost expects
     X_dev = X_dev.astype({'Sex': int, 'Race': int})
@@ -292,6 +313,24 @@ def main():
 
     iter_imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=10, min_value=0, verbose=0)
     iter_imputer.fit(X_train)
+
+    X_sanity = X_dev.dropna(axis='rows')
+    y_sanity = y_dev.loc[X_sanity.index]
+    X_sanity = pd.concat(
+        [X_sanity[y_sanity == 1].sample(n=50, random_state=seed),
+         X_sanity[y_sanity == 0].sample(n=50, random_state=seed)])
+    y_sanity = y_sanity.loc[X_sanity.index]
+
+
+    run_exp_nn(X_sanity, y_sanity, X_val, y_val, {}, 100, iter_imputer, seed)
+
+    print('\nRunning sanity check')
+    run_exp_sanity_check(X_sanity,
+                         y_sanity,
+                         max_evals=1000,
+                         task_type=task_type,
+                         seed=seed,
+                         train_dir=str(logs_dir / 'catboost_logs_sanity'))
 
     log_regr_params = {'penalty': 'elasticnet',
                        'C': hp.uniform('C', .25, 4),
@@ -519,6 +558,7 @@ if __name__ == '__main__':
     main()
 
 ''' TODO: misc
+Do a NN model
 Add SHAP to the jupyter Notebook
 Use the whole HANES dataset from CDC or another survivale dataset e.g. https://archive.ics.uci.edu/ml/datasets/HCC+Survival explore Seaborne for preliminary data analysis
 Instead of checking if survival after 10 years, estimate the number of years of survival
