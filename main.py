@@ -15,8 +15,10 @@ from catboost import CatBoostClassifier, Pool, cv, EFstrType
 from sklearn.impute import IterativeImputer, SimpleImputer
 from sklearn.metrics import roc_auc_score, log_loss
 from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import MinMaxScaler
 from hyperopt import fmin, tpe, hp
 import tensorflow as tf
+from tensorflow.keras.layers import Dense, Dropout
 from time import time
 
 from util import load_data
@@ -34,37 +36,78 @@ def run_exp_nn(X_train,
                y_train,
                X_val,
                y_val,
-               param_space,
+               params,
                max_evals,
                imputer,
+               train_dir,
                seed):
-    X_train_imputed_for_1_hot = pd.DataFrame(imputer.transform(X_train), columns=X_train.columns)
-    X_train_imputed_for_1_hot = X_train_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
-    X_val_imputed_for_1_hot = pd.DataFrame(imputer.transform(X_val), columns=X_val.columns)
-    X_val_imputed_for_1_hot = X_val_imputed_for_1_hot.astype({'Sex': int, 'Race': int})
+    X_train_imputed = pd.DataFrame(imputer.transform(X_train), columns=X_train.columns)
+    X_train_imputed = X_train_imputed.astype({'Sex': int, 'Race': int})
+    X_val_imputed = pd.DataFrame(imputer.transform(X_val), columns=X_val.columns)
+    X_val_imputed = X_val_imputed.astype({'Sex': int, 'Race': int})
 
-    print('\nFitting logistic regression with iterative imputation')
-    X_train_1_hot = pd.get_dummies(X_train_imputed_for_1_hot, columns=['Sex', 'Race'])
-    X_val_1_hot = pd.get_dummies(X_val_imputed_for_1_hot, columns=['Sex', 'Race'])
+    minmax_scaler = MinMaxScaler()
+    columns = [col for col in X_train_imputed.columns if col not in {'Sex', 'Race'}]
+    X_train_scaled = minmax_scaler.fit_transform(X_train_imputed[columns])
+    X_train_imputed = pd.concat((pd.DataFrame(X_train_scaled, columns=columns), X_train_imputed[['Sex', 'Race']]),
+                                axis='columns')
+    X_val_scaled = minmax_scaler.transform(X_val_imputed[columns])
+    X_val_imputed = pd.concat((pd.DataFrame(X_val_scaled, columns=columns), X_val_imputed[['Sex', 'Race']]),
+                              axis='columns')
+
+    X_train_1_hot = pd.get_dummies(X_train_imputed, columns=['Sex', 'Race'])
+    X_val_1_hot = pd.get_dummies(X_val_imputed, columns=['Sex', 'Race'])
+
     n_vars = len(X_train_1_hot.columns)
 
-    tf.random.set_seed(seed)
-    model = tf.keras.Sequential([
-        tf.keras.layers.Dense(n_vars, activation='relu', input_shape=(n_vars,)),
-        tf.keras.layers.Dense(1, activation='sigmoid')  # TF unable to compute metric AUC if activation here is linear
-    ])
+    # Calculate bias for initialization of the final layer
+    p = sum(y_val) / len(y_val)  # Frequency of positive training samples
+    bias_init = - np.log(1 / p - 1)
 
-    model.compile(optimizer=tf.keras.optimizers.Adam(),
-                  loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
-                  metrics=[tf.keras.metrics.AUC()])
-    print(model.summary())
-    model.fit(X_train_1_hot,
-              y_train,
-              # validation_data=(X_val_1_hot, y_val),
-              epochs=100,
-              batch_size=64)
+    def objective(params):
+        tf.random.set_seed(seed)
+        model = tf.keras.Sequential([
+            Dense(n_vars,
+                  input_shape=(n_vars,),
+                  # kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
+                  activation='relu'),
+            Dropout(rate=params['dropout_rate']),  # rate is fraction of units to drop
+            Dense(n_vars,
+                  input_shape=(n_vars,),
+                  # kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
+                  activation='relu'),
+            Dropout(rate=params['dropout_rate']),
+            Dense(1,
+                  bias_initializer=tf.keras.initializers.Constant(bias_init),
+                  activation='sigmoid')  # TF unable to compute metric AUC if activation here is linear
+        ])
 
-    # TODO Check https://github.com/tensorflow/tensorflow/issues/36465
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=params['learning_rate']),
+                      loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
+                      metrics=[tf.keras.metrics.AUC(name='auc')])
+        # print(model.summary())
+        # pre = model.predict_proba(X_val_1_hot)
+        # tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=train_dir, histogram_freq=1, profile_batch=0)
+        res = model.fit(X_train_1_hot,
+                        y_train,
+                        validation_data=(X_val_1_hot, y_val),
+                        epochs=params['epochs'],
+                        batch_size=int(params['batch_size']),
+                        # callbacks=[tensorboard_callback],
+                        verbose=0)
+
+        best_epoch = np.argmax(res.history['val_auc'])
+        val_auc = res.history['val_auc'][best_epoch]
+        val_loss = res.history['val_loss'][best_epoch]
+        train_auc = res.history['auc'][best_epoch]
+        train_loss = res.history['loss'][best_epoch]
+        return -val_auc
+
+    rstate = np.random.RandomState(seed)
+    best = fmin(fn=objective, space=params, algo=tpe.suggest, max_evals=max_evals, rstate=rstate)
+    print(best)
+
+    # TODO Check https://github.com/tensorflow/tensorflow/issues/36465 and also https://www.tensorflow.org/guide/gpu#limiting_gpu_memory_growth
 
 
 def run_exp_log_regr(X_train,
@@ -264,8 +307,9 @@ def run_exp_sanity_check(X_train,
 def main():
     #############################################################################################################
     seed = 42  # For random numbers generation
-    iterations = 300  # Max number of iterations at every run of gradien boosting (max number of trees built)
-    hyper_iterations = 100  # Number of iterations required during each Bayesian optimization of hyper-parameters
+    iterations = 300  # Max number of iterations at every run of gradient boosting (max number of trees built)
+    epochs = 50  # Max number of epochs for the NN model
+    hyper_iterations = 10  # Number of iterations required during each Bayesian optimization of hyper-parameters
     log_regs_hyper_iterations = 10  # Number of iterations for hyper-parameters optimization for logistic regression
     cv_folds = 4  # Number of folds used for k-folds cross-validation
     logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
@@ -300,8 +344,8 @@ def main():
     X_train, X_val, y_train, y_val = train_test_split(X_dev, y_dev, test_size=0.2, random_state=seed)
 
     # Make a dataset after dropping samples with missing data (note, no samples with missing data in test set)
-    X_dev_dropped = X_dev.dropna(axis='rows')
-    y_dev_dropped = y_dev.loc[X_dev_dropped.index]
+    # X_dev_dropped = X_dev.dropna(axis='rows')
+    # y_dev_dropped = y_dev.loc[X_dev_dropped.index]
     X_train_dropped = X_train.dropna(axis='rows')
     y_train_dropped = y_train.loc[X_train_dropped.index]
     X_val_dropped = X_val.dropna(axis='rows')
@@ -317,12 +361,25 @@ def main():
     X_sanity = X_dev.dropna(axis='rows')
     y_sanity = y_dev.loc[X_sanity.index]
     X_sanity = pd.concat(
-        [X_sanity[y_sanity == 1].sample(n=50, random_state=seed),
-         X_sanity[y_sanity == 0].sample(n=50, random_state=seed)])
+        [X_sanity[y_sanity == 1].sample(n=32, random_state=seed),
+         X_sanity[y_sanity == 0].sample(n=32, random_state=seed)])
     y_sanity = y_sanity.loc[X_sanity.index]
 
+    params = {'learning_rate': hp.loguniform('learning_rate', np.log(.0001), np.log(.01)),
+              # 'learning_rate': 3e-4,
+              'epochs': epochs,
+              'batch_size': hp.quniform('batch_size', 8, 64, 1),
+              'dropout_rate': hp.uniform('dropout_rate', .0, .5)}
 
-    run_exp_nn(X_sanity, y_sanity, X_val, y_val, {}, 100, iter_imputer, seed)
+    run_exp_nn(X_train,
+               y_train,
+               X_val,
+               y_val,
+               params=params,
+               max_evals=hyper_iterations,
+               imputer=iter_imputer,
+               train_dir=str(logs_dir / 'tensorflow_logs_nn'),
+               seed=seed)
 
     print('\nRunning sanity check')
     run_exp_sanity_check(X_sanity,
