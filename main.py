@@ -64,48 +64,75 @@ def run_exp_nn(X_train,
     p = sum(y_val) / len(y_val)  # Frequency of positive training samples
     bias_init = - np.log(1 / p - 1)
 
-    def objective(params):
-        tf.random.set_seed(seed)
+    def make_nn_model(dropout_rate, learning_rate):
         model = tf.keras.Sequential([
             Dense(n_vars,
                   input_shape=(n_vars,),
                   # kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
                   activation='relu'),
-            Dropout(rate=params['dropout_rate']),  # rate is fraction of units to drop
+            Dropout(rate=dropout_rate),  # rate is fraction of units to drop
             Dense(n_vars,
                   input_shape=(n_vars,),
                   # kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
                   activation='relu'),
-            Dropout(rate=params['dropout_rate']),
+            Dropout(rate=dropout_rate),
             Dense(1,
                   bias_initializer=tf.keras.initializers.Constant(bias_init),
                   activation='sigmoid')  # TF unable to compute metric AUC if activation here is linear
         ])
 
-        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=params['learning_rate']),
+        model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
                       loss=tf.keras.losses.BinaryCrossentropy(from_logits=False),
                       metrics=[tf.keras.metrics.AUC(name='auc')])
+        return model
+
+
+    def objective(params):
+        tf.random.set_seed(seed)
+        model = make_nn_model(dropout_rate=params['dropout_rate'],
+                              learning_rate=params['learning_rate'])
         # print(model.summary())
         # pre = model.predict_proba(X_val_1_hot)
-        # tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=train_dir, histogram_freq=1, profile_batch=0)
         res = model.fit(X_train_1_hot,
                         y_train,
                         validation_data=(X_val_1_hot, y_val),
                         epochs=params['epochs'],
                         batch_size=int(params['batch_size']),
-                        # callbacks=[tensorboard_callback],
                         verbose=0)
 
         best_epoch = np.argmax(res.history['val_auc'])
         val_auc = res.history['val_auc'][best_epoch]
-        val_loss = res.history['val_loss'][best_epoch]
-        train_auc = res.history['auc'][best_epoch]
-        train_loss = res.history['loss'][best_epoch]
         return -val_auc
 
+    # Make an empty model, and then delete it, just to open CUDA libraries
+    dummy = tf.keras.Sequential()
+    del dummy
     rstate = np.random.RandomState(seed)
     best = fmin(fn=objective, space=params, algo=tpe.suggest, max_evals=max_evals, rstate=rstate)
-    print(best)
+    all_best_params = params
+    for key, value in best.items():
+        all_best_params[key] = value
+    print('Best validated model was trained with hyper-parameters', all_best_params)
+    print('Retraining and validating it')  # TODO change to x-validation
+    model = make_nn_model(dropout_rate=all_best_params['dropout_rate'],
+                              learning_rate=all_best_params['learning_rate'])
+    tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=train_dir, histogram_freq=1, profile_batch=0)
+    res = model.fit(X_train_1_hot,
+                    y_train,
+                    validation_data=(X_val_1_hot, y_val),
+                    epochs=all_best_params['epochs'],
+                    batch_size=int(all_best_params['batch_size']),
+                    callbacks=[tensorboard_callback],
+                    verbose=1)
+
+    best_epoch = np.argmax(res.history['val_auc'])
+    val_auc = res.history['val_auc'][best_epoch]
+    val_loss = res.history['val_loss'][best_epoch]
+    train_auc = res.history['auc'][best_epoch]
+    train_loss = res.history['loss'][best_epoch]
+    print('Best model epoch is',best_epoch)
+    print(f'Training: loss={train_loss}   auc={train_auc}')
+    print(f'Validation: loss={val_loss}   auc={val_auc}')
 
     # TODO Check https://github.com/tensorflow/tensorflow/issues/36465 and also https://www.tensorflow.org/guide/gpu#limiting_gpu_memory_growth
 
@@ -309,7 +336,7 @@ def main():
     seed = 42  # For random numbers generation
     iterations = 300  # Max number of iterations at every run of gradient boosting (max number of trees built)
     epochs = 50  # Max number of epochs for the NN model
-    hyper_iterations = 10  # Number of iterations required during each Bayesian optimization of hyper-parameters
+    hyper_iterations = 3  # Number of iterations required during each Bayesian optimization of hyper-parameters
     log_regs_hyper_iterations = 10  # Number of iterations for hyper-parameters optimization for logistic regression
     cv_folds = 4  # Number of folds used for k-folds cross-validation
     logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
@@ -319,7 +346,7 @@ def main():
 
     start_time = time()
 
-    # Make the logs directory, if it doesn't exist already, and make sure it is empty
+    # Make the logs directory, if it doesn't exist already, and ensure it is empty
     logs_dir.mkdir(exist_ok=True)
     for item in logs_dir.iterdir():
         if item.is_dir():
@@ -368,7 +395,7 @@ def main():
     params = {'learning_rate': hp.loguniform('learning_rate', np.log(.0001), np.log(.01)),
               # 'learning_rate': 3e-4,
               'epochs': epochs,
-              'batch_size': hp.quniform('batch_size', 8, 64, 1),
+              'batch_size': hp.quniform('batch_size', 16, 64, 1),
               'dropout_rate': hp.uniform('dropout_rate', .0, .5)}
 
     run_exp_nn(X_train,
@@ -615,7 +642,7 @@ if __name__ == '__main__':
     main()
 
 ''' TODO: misc
-Do a NN model
+Add early stoppoing to NN
 Add SHAP to the jupyter Notebook
 Use the whole HANES dataset from CDC or another survivale dataset e.g. https://archive.ics.uci.edu/ml/datasets/HCC+Survival explore Seaborne for preliminary data analysis
 Instead of checking if survival after 10 years, estimate the number of years of survival
