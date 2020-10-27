@@ -68,12 +68,12 @@ def run_exp_nn(X_train,
         model = tf.keras.Sequential([
             Dense(n_vars,
                   input_shape=(n_vars,),
-                  # kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
+                  kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
                   activation='relu'),
             Dropout(rate=dropout_rate),  # rate is fraction of units to drop
             Dense(n_vars,
                   input_shape=(n_vars,),
-                  # kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
+                  kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
                   activation='relu'),
             Dropout(rate=dropout_rate),
             Dense(1,
@@ -117,6 +117,7 @@ def run_exp_nn(X_train,
     model = make_nn_model(dropout_rate=all_best_params['dropout_rate'],
                               learning_rate=all_best_params['learning_rate'])
     tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=train_dir, histogram_freq=1, profile_batch=0)
+    tf.random.set_seed(seed)
     res = model.fit(X_train_1_hot,
                     y_train,
                     validation_data=(X_val_1_hot, y_val),
@@ -130,7 +131,7 @@ def run_exp_nn(X_train,
     val_loss = res.history['val_loss'][best_epoch]
     train_auc = res.history['auc'][best_epoch]
     train_loss = res.history['loss'][best_epoch]
-    print('Best model epoch is',best_epoch)
+    print('Best model epoch (first epoch is 0) is',best_epoch)
     print(f'Training: loss={train_loss}   auc={train_auc}')
     print(f'Validation: loss={val_loss}   auc={val_auc}')
 
@@ -334,7 +335,7 @@ def run_exp_sanity_check(X_train,
 def main():
     #############################################################################################################
     seed = 42  # For random numbers generation
-    iterations = 300  # Max number of iterations at every run of gradient boosting (max number of trees built)
+    iterations = 100  # Max number of iterations at every run of gradient boosting (max number of trees built)
     epochs = 50  # Max number of epochs for the NN model
     hyper_iterations = 3  # Number of iterations required during each Bayesian optimization of hyper-parameters
     log_regs_hyper_iterations = 10  # Number of iterations for hyper-parameters optimization for logistic regression
@@ -398,6 +399,7 @@ def main():
               'batch_size': hp.quniform('batch_size', 16, 64, 1),
               'dropout_rate': hp.uniform('dropout_rate', .0, .5)}
 
+    print('\nTuning hyper-parameters for NN')
     run_exp_nn(X_train,
                y_train,
                X_val,
