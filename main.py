@@ -19,7 +19,8 @@ from sklearn.preprocessing import MinMaxScaler
 from hyperopt import fmin, tpe, hp
 import tensorflow as tf
 from tensorflow.keras.layers import Dense, Dropout
-from time import time
+from time import time, sleep
+from multiprocessing import Process
 
 from util import load_data
 
@@ -64,18 +65,18 @@ def run_exp_nn(X_train,
     p = sum(y_val) / len(y_val)  # Frequency of positive training samples
     bias_init = - np.log(1 / p - 1)
 
-    def make_nn_model(dropout_rate, learning_rate):
+    def make_nn_model(learning_rate, l1, l2):
         model = tf.keras.Sequential([
             Dense(n_vars,
                   input_shape=(n_vars,),
-                  kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
+                  kernel_regularizer=tf.keras.regularizers.l1_l2(l1=l1, l2=l2),
                   activation='relu'),
-            Dropout(rate=dropout_rate),  # rate is fraction of units to drop
+            # Dropout(rate=dropout_rate),  # rate is fraction of units to drop
             Dense(n_vars,
                   input_shape=(n_vars,),
-                  kernel_regularizer=tf.keras.regularizers.l1_l2(l1=.001, l2=.001),
+                  kernel_regularizer=tf.keras.regularizers.l1_l2(l1=l1, l2=l2),
                   activation='relu'),
-            Dropout(rate=dropout_rate),
+            # Dropout(rate=dropout_rate),
             Dense(1,
                   bias_initializer=tf.keras.initializers.Constant(bias_init),
                   activation='sigmoid')  # TF unable to compute metric AUC if activation here is linear
@@ -86,11 +87,11 @@ def run_exp_nn(X_train,
                       metrics=[tf.keras.metrics.AUC(name='auc')])
         return model
 
-
     def objective(params):
         tf.random.set_seed(seed)
-        model = make_nn_model(dropout_rate=params['dropout_rate'],
-                              learning_rate=params['learning_rate'])
+        model = make_nn_model(learning_rate=params['learning_rate'],
+                              l1=params['l1'],
+                              l2=params['l2'])
         # print(model.summary())
         # pre = model.predict_proba(X_val_1_hot)
         res = model.fit(X_train_1_hot,
@@ -114,8 +115,10 @@ def run_exp_nn(X_train,
         all_best_params[key] = value
     print('Best validated model was trained with hyper-parameters', all_best_params)
     print('Retraining and validating it')  # TODO change to x-validation
-    model = make_nn_model(dropout_rate=all_best_params['dropout_rate'],
-                              learning_rate=all_best_params['learning_rate'])
+    model = make_nn_model(learning_rate=all_best_params['learning_rate'],
+                          l1=all_best_params['l1'],
+                          l2=all_best_params['l2'])
+
     tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=train_dir, histogram_freq=1, profile_batch=0)
     tf.random.set_seed(seed)
     res = model.fit(X_train_1_hot,
@@ -131,7 +134,7 @@ def run_exp_nn(X_train,
     val_loss = res.history['val_loss'][best_epoch]
     train_auc = res.history['auc'][best_epoch]
     train_loss = res.history['loss'][best_epoch]
-    print('Best model epoch (first epoch is 0) is',best_epoch)
+    print('Best model epoch (first epoch is 0) is', best_epoch)
     print(f'Training: loss={train_loss}   auc={train_auc}')
     print(f'Validation: loss={val_loss}   auc={val_auc}')
 
@@ -335,10 +338,10 @@ def run_exp_sanity_check(X_train,
 def main():
     #############################################################################################################
     seed = 42  # For random numbers generation
-    iterations = 100  # Max number of iterations at every run of gradient boosting (max number of trees built)
-    epochs = 50  # Max number of epochs for the NN model
+    iterations = 20  # Max number of iterations at every run of gradient boosting (max number of trees built)
+    epochs = 20  # Max number of epochs for the NN model
     hyper_iterations = 3  # Number of iterations required during each Bayesian optimization of hyper-parameters
-    log_regs_hyper_iterations = 10  # Number of iterations for hyper-parameters optimization for logistic regression
+    log_regs_hyper_iterations = 2  # Number of iterations for hyper-parameters optimization for logistic regression
     cv_folds = 4  # Number of folds used for k-folds cross-validation
     logs_dir = Path('catboost_logs')  # Relative to the directory where the program is running
     task_type = 'GPU'  # Can be 'CPU' or 'GPU'
@@ -392,23 +395,6 @@ def main():
         [X_sanity[y_sanity == 1].sample(n=32, random_state=seed),
          X_sanity[y_sanity == 0].sample(n=32, random_state=seed)])
     y_sanity = y_sanity.loc[X_sanity.index]
-
-    params = {'learning_rate': hp.loguniform('learning_rate', np.log(.0001), np.log(.01)),
-              # 'learning_rate': 3e-4,
-              'epochs': epochs,
-              'batch_size': hp.quniform('batch_size', 16, 64, 1),
-              'dropout_rate': hp.uniform('dropout_rate', .0, .5)}
-
-    print('\nTuning hyper-parameters for NN')
-    run_exp_nn(X_train,
-               y_train,
-               X_val,
-               y_val,
-               params=params,
-               max_evals=hyper_iterations,
-               imputer=iter_imputer,
-               train_dir=str(logs_dir / 'tensorflow_logs_nn'),
-               seed=seed)
 
     print('\nRunning sanity check')
     run_exp_sanity_check(X_sanity,
@@ -562,7 +548,26 @@ def main():
                                  train_dir=str(logs_dir / 'catboost_logs_grid_search'),
                                  task_type=task_type)
 
-    # Cross-validate the two selected models, and test them on the test set
+    params = {'learning_rate': hp.loguniform('learning_rate', np.log(.0001), np.log(.01)),
+              # 'learning_rate': 3e-4,
+              'epochs': epochs,
+              'batch_size': hp.quniform('batch_size', 16, 64, 1),
+              # 'dropout_rate': hp.uniform('dropout_rate', .0, .5)
+              'l1': hp.loguniform('l1', np.log(.001), np.log(.01)),
+              'l2': hp.loguniform('l2', np.log(.001), np.log(.01))}
+
+    """
+    print('\nTuning hyper-parameters for NN')
+    p = Process(target=run_exp_nn,
+                args=(X_train, y_train, X_val, y_val, params, hyper_iterations,
+                      iter_imputer,
+                      str(logs_dir / 'tensorflow_logs_nn'),
+                      seed))
+    p.start()
+    p.join()
+    sleep(2.)
+    """
+    # Cross-validate the selected model, and test it on the test set
 
     model = selected_model
     imputer = None
@@ -644,7 +649,7 @@ if __name__ == '__main__':
     main()
 
 ''' TODO: misc
-Add early stoppoing to NN
+Add early stopping to NN, and move it to its own notebook
 Add SHAP to the jupyter Notebook
 Use the whole HANES dataset from CDC or another survivale dataset e.g. https://archive.ics.uci.edu/ml/datasets/HCC+Survival explore Seaborne for preliminary data analysis
 Instead of checking if survival after 10 years, estimate the number of years of survival
