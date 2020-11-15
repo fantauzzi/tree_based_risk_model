@@ -1,10 +1,10 @@
+# %%
 # from matplotlib import use
 # use('TkAgg')
+
 import matplotlib.pyplot as plt
-import pydotplus
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import shutil
 from pathlib import Path
 from IPython.display import Image
@@ -19,12 +19,11 @@ from sklearn.preprocessing import MinMaxScaler
 from hyperopt import fmin, tpe, hp
 import tensorflow as tf
 from tensorflow.keras.layers import Dense, Dropout
-from time import time, sleep
-from multiprocessing import Process
+from time import time
 
 from util import load_data
 
-
+# %%
 def make_imputed_pool(X, y, imputer, cat_features, weight=None):
     X_imputed = X if imputer is None else pd.DataFrame(imputer.transform(X), columns=X.columns)
     # imputer.transform() above has converted the int columns with categories into float, need to be converted back to int
@@ -33,6 +32,7 @@ def make_imputed_pool(X, y, imputer, cat_features, weight=None):
     return pool, X_imputed
 
 
+# %%
 def run_exp_nn(X_train,
                y_train,
                X_val,
@@ -141,6 +141,7 @@ def run_exp_nn(X_train,
     # TODO Check https://github.com/tensorflow/tensorflow/issues/36465 and also https://www.tensorflow.org/guide/gpu#limiting_gpu_memory_growth
 
 
+# %%
 def run_exp_log_regr(X_train,
                      y_train,
                      X_val,
@@ -184,13 +185,13 @@ def run_exp_log_regr(X_train,
     print(f'Validation AUC is {log_regr_auc} achieved in {log_regr_model.n_iter_[0]} iterations')
     return log_regr_model
 
-
+# %%
 # Find out how many samples have missing data in one or more variables (columns)
 def count_samples_with_missing_data(df):
     res = sum(df.isnull().any(axis='columns'))
     return res
 
-
+# %%
 def run_exp_bayes_hyperparams_opt(X_train,
                                   y_train,
                                   X_val,
@@ -256,6 +257,7 @@ def run_exp_bayes_hyperparams_opt(X_train,
     return refit_model
 
 
+# %%
 def compute_weights(y):
     """
     Computes and returns the weights for every sample, such that if the positive samples are n
@@ -278,6 +280,7 @@ def compute_weights(y):
     return w, {'total_pos': total_pos, 'total_neg': total_neg, 'pos_weight': pos_weight, 'neg_weight': neg_weight}
 
 
+# %%
 def run_exp_grid_hyperparams_opt(X,
                                  y,
                                  cat_features,
@@ -317,6 +320,7 @@ def run_exp_grid_hyperparams_opt(X,
     return model
 
 
+# %%
 def run_exp_sanity_check(X_train,
                          y_train,
                          max_evals,
@@ -335,6 +339,7 @@ def run_exp_sanity_check(X_train,
     return model
 
 
+# %%
 def main():
     #############################################################################################################
     seed = 42  # For random numbers generation
@@ -375,8 +380,6 @@ def main():
     X_train, X_val, y_train, y_val = train_test_split(X_dev, y_dev, test_size=0.2, random_state=seed)
 
     # Make a dataset after dropping samples with missing data (note, no samples with missing data in test set)
-    # X_dev_dropped = X_dev.dropna(axis='rows')
-    # y_dev_dropped = y_dev.loc[X_dev_dropped.index]
     X_train_dropped = X_train.dropna(axis='rows')
     y_train_dropped = y_train.loc[X_train_dropped.index]
     X_val_dropped = X_val.dropna(axis='rows')
@@ -386,9 +389,11 @@ def main():
     mean_imputer = SimpleImputer(strategy='mean', verbose=0)
     mean_imputer.fit(X_train)
 
+    # Impute missing values using an iterative imputer
     iter_imputer = IterativeImputer(random_state=seed, sample_posterior=False, max_iter=10, min_value=0, verbose=0)
     iter_imputer.fit(X_train)
 
+    # Make a tiny dataset with an equal number of positive and negative samples, that will be used for sanity check
     X_sanity = X_dev.dropna(axis='rows')
     y_sanity = y_dev.loc[X_sanity.index]
     X_sanity = pd.concat(
@@ -396,6 +401,7 @@ def main():
          X_sanity[y_sanity == 0].sample(n=32, random_state=seed)])
     y_sanity = y_sanity.loc[X_sanity.index]
 
+    # Run a sanity cehck: intentionally overfit a tiny subset of the dataset. If the pipeline 
     print('\nRunning sanity check')
     run_exp_sanity_check(X_sanity,
                          y_sanity,
@@ -652,6 +658,7 @@ if __name__ == '__main__':
 Add early stopping to NN, and move it to its own notebook
 Add SHAP to the jupyter Notebook
 Use the whole HANES dataset from CDC or another survivale dataset e.g. https://archive.ics.uci.edu/ml/datasets/HCC+Survival explore Seaborne for preliminary data analysis
+also https://www.sciencedirect.com/science/article/pii/S1532046415002063 and https://data.world/datasets/survival
 Instead of checking if survival after 10 years, estimate the number of years of survival
 C-index is the same as the ROC AUC for logistic regression.
    see https://www.statisticshowto.com/c-statistic/#:~:text=A%20weighted%20c-index%20is,correctly%20predicting%20a%20negative%20outcome
